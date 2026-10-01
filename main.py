@@ -1,13 +1,15 @@
 import hashlib
 import hmac
+import html
 import logging
 import os
 import re
 import shlex
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Iterator, Optional
 
 from aiohttp import web
 from dateutil import parser as date_parser
@@ -40,6 +42,34 @@ class Task:
     status: str
 
 
+@dataclass
+class InboundEmail:
+    subject: str
+    body: str
+    html_body: str = ""
+    sender: str = ""
+    message_id: str = ""
+    gmail_thread_id: str = ""
+    received_at: str = ""
+
+
+@dataclass
+class FiverrOrder:
+    order_id: str
+    client_name: str
+    due: datetime
+    source: str
+    message_id: str
+    received_at: str = ""
+
+
+@dataclass
+class FiverrDecision:
+    action: str
+    reason: str
+    order: Optional[FiverrOrder] = None
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -47,10 +77,18 @@ def setup_logging() -> None:
     )
 
 
-def get_db() -> sqlite3.Connection:
+@contextmanager
+def get_db() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -99,6 +137,36 @@ def init_db() -> None:
                 prompt_message_id INTEGER NOT NULL,
                 created_at_utc TEXT NOT NULL,
                 PRIMARY KEY (chat_id, task_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fiverr_orders (
+                order_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                client_name TEXT NOT NULL,
+                task_id INTEGER,
+                topic_thread_id INTEGER,
+                source TEXT NOT NULL,
+                first_message_id TEXT,
+                last_message_id TEXT,
+                status TEXT NOT NULL DEFAULT 'processing',
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                message_id TEXT,
+                order_id TEXT,
+                reason TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
             )
             """
         )
@@ -388,6 +456,97 @@ def clear_pending_assignment(chat_id: int, task_id: int) -> None:
         )
 
 
+def reserve_fiverr_order(order: FiverrOrder, chat_id: int) -> tuple[Optional[sqlite3.Row], bool]:
+    now = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO fiverr_orders
+            (order_id, chat_id, client_name, source, first_message_id, last_message_id, status, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, 'processing', ?, ?)
+            """,
+            (
+                order.order_id,
+                chat_id,
+                order.client_name,
+                order.source,
+                order.message_id,
+                order.message_id,
+                now,
+                now,
+            ),
+        )
+        inserted = cursor.rowcount == 1
+        conn.execute(
+            """
+            UPDATE fiverr_orders
+            SET last_message_id = COALESCE(NULLIF(?, ''), last_message_id),
+                updated_at_utc = ?
+            WHERE order_id = ?
+            """,
+            (order.message_id, now, order.order_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM fiverr_orders WHERE order_id = ?",
+            (order.order_id,),
+        ).fetchone()
+        return row, inserted
+
+
+def mark_fiverr_order_created(
+    order_id: str,
+    task_id: int,
+    topic_thread_id: Optional[int],
+) -> None:
+    now = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE fiverr_orders
+            SET task_id = ?, topic_thread_id = ?, status = 'created', updated_at_utc = ?
+            WHERE order_id = ?
+            """,
+            (task_id, topic_thread_id, now, order_id),
+        )
+
+
+def mark_fiverr_order_quarantined(order_id: str, reason: str) -> None:
+    now = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE fiverr_orders
+            SET status = ?, updated_at_utc = ?
+            WHERE order_id = ? AND task_id IS NULL
+            """,
+            (f"quarantined:{reason}", now, order_id),
+        )
+
+
+def save_inbound_quarantine(
+    source: str,
+    message_id: str,
+    order_id: Optional[str],
+    reason: str,
+    subject: str,
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO inbound_quarantine (source, message_id, order_id, reason, subject, created_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source,
+                message_id,
+                order_id,
+                reason,
+                subject[:500],
+                datetime.now(tz=ZoneInfo("UTC")).isoformat(),
+            ),
+        )
+
+
 def get_topic_thread_id(chat_id: int, name: str) -> Optional[int]:
     with get_db() as conn:
         row = conn.execute(
@@ -538,36 +697,127 @@ def verify_mailgun_signature(timestamp: str, token: str, signature: str) -> bool
     return hmac.compare_digest(digest, signature)
 
 
+def normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(value or "")).strip()
+
+
+def html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return html.unescape(text)
+
+
+def email_search_text(email: InboundEmail) -> str:
+    parts = [
+        email.subject,
+        email.body,
+        html_to_text(email.html_body),
+        email.html_body,
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def extract_email_name(text: str) -> Optional[str]:
+    match = re.search(r"email_name=([A-Za-z0-9_]+)", text or "")
+    return match.group(1) if match else None
+
+
+def parse_inbound_received_at(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = date_parser.parse(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(ZoneInfo("UTC"))
+
+
+def is_before_fiverr_cutover(email: InboundEmail) -> bool:
+    cutover = get_setting("fiverr_cutover_utc")
+    if not cutover:
+        return False
+    cutover_dt = parse_inbound_received_at(cutover)
+    received_dt = parse_inbound_received_at(email.received_at)
+    if not cutover_dt or not received_dt:
+        return False
+    return received_dt < cutover_dt
+
+
+def extract_fiverr_order_id(text: str) -> Optional[str]:
+    patterns = [
+        r"\b(FO[A-Z0-9]{8,})\b",
+        r"(?i)order\s*#\s*([A-Z0-9]{6,})",
+        r"(?i)order\s+no\.?\s*([A-Z0-9]{6,})",
+        r"#([A-Za-z0-9]{6,})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def clean_client_name(value: str) -> str:
+    name = html.unescape(value or "")
+    name = re.sub(r"https?://\S+", "", name)
+    name = re.sub(r"\s*(?:please review|feels good|is due|due on|with requirements?).*$", "", name, flags=re.I)
+    name = re.sub(r"[!.:\s]+$", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:120] or "Fiverr Client"
+
+
 def extract_client_name(subject: str, body: str) -> Optional[str]:
+    combined = f"{subject}\n{body}"
     patterns = [
         r"(?i)order from[:\-]\s*(.+)",
         r"(?i)you received an order from\s+(.+)",
         r"(?i)you just received an order from\s+(.+)",
         r"(?i)you'?ve received an order from\s+(.+)",
+        r"(?i)great news:\s*you'?ve received an order from\s+(.+)",
+        r"(?i)\byour order\s+FO[A-Z0-9]+\s+with\s+(.+?)\s+due\b",
         r"(?i)buyer[:\-]\s*(.+)",
         r"(?i)client[:\-]\s*(.+)",
         r"(?i)from[:\-]\s*(.+)",
     ]
-    for line in body.splitlines():
+    for line in combined.splitlines():
         line = line.strip()
         if not line:
             continue
         for pat in patterns:
             m = re.search(pat, line)
             if m:
-                name = m.group(1).strip()
-                name = re.sub(r"[!.:\s]+$", "", name)
+                name = clean_client_name(m.group(1))
                 return name
     m = re.search(r"(?i)from\s+(.+)", subject or "")
     if m:
-        name = m.group(1).strip()
-        name = re.sub(r"[!.:\s]+$", "", name)
+        name = clean_client_name(m.group(1))
         return name
     return None
 
 
 def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
     combined = f"{subject}\n{body}"
+    due_patterns = [
+        r"(?i)\bdue on\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
+        r"(?i)\bdue\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
+        r"(?i)\bis due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
+    ]
+    for pattern in due_patterns:
+        m = re.search(pattern, combined)
+        if m:
+            try:
+                dt = date_parser.parse(m.group(1))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ)
+                return dt
+            except (OverflowError, ValueError, TypeError):
+                pass
     # Strong pattern: "is due Feb 11, 2026"
     m = re.search(r"(?i)is due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})", combined)
     if m:
@@ -576,7 +826,7 @@ def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=TZ)
             return dt
-        except (ValueError, TypeError):
+        except (OverflowError, ValueError, TypeError):
             pass
     # Fallback: "due Feb 11, 2026"
     m = re.search(r"(?i)due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})", combined)
@@ -586,7 +836,7 @@ def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=TZ)
             return dt
-        except (ValueError, TypeError):
+        except (OverflowError, ValueError, TypeError):
             pass
     candidate_lines = []
     for line in body.splitlines():
@@ -597,7 +847,7 @@ def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
     for line in candidate_lines:
         try:
             dt = date_parser.parse(line, fuzzy=True, default=now_local)
-        except (ValueError, TypeError):
+        except (OverflowError, ValueError, TypeError):
             continue
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ)
@@ -606,8 +856,67 @@ def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
 
 
 def extract_order_id(text: str) -> Optional[str]:
-    m = re.search(r"#([A-Za-z0-9]{6,})", text)
-    return m.group(1) if m else None
+    return extract_fiverr_order_id(text)
+
+
+def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
+    if is_before_fiverr_cutover(email):
+        return FiverrDecision("ignore", "before_fiverr_cutover")
+
+    text = email_search_text(email)
+    normalized = normalize_text(text).lower()
+    email_name = (extract_email_name(text) or "").lower()
+    order_id = extract_fiverr_order_id(text)
+
+    buyer_or_delivery_markers = [
+        "gig_order_created_to_buyer",
+        "gig_order_delivered_to_buyer",
+        "delivered_to_buyer",
+        "status of your order",
+        "your order no.",
+    ]
+    if any(marker in email_name or marker in normalized for marker in buyer_or_delivery_markers):
+        return FiverrDecision("ignore", "buyer_or_delivery_notification")
+
+    seller_start_email_names = {
+        "gig_order_started_seller",
+        "gig_order_with_requirements_started_to_seller",
+    }
+    seller_start_phrases = [
+        "you just received an order from",
+        "you've just received an order from",
+        "you received an order from",
+        "you've received an order from",
+        "great news: you've received an order from",
+    ]
+    is_seller_start = (
+        email_name in seller_start_email_names
+        or any(phrase in normalized for phrase in seller_start_phrases)
+    )
+
+    follow_up_markers = [
+        "view_requirements_reminder",
+        "work_plan_order_created",
+        "waiting for requirements",
+    ]
+    if not is_seller_start and any(marker in email_name or marker in normalized for marker in follow_up_markers):
+        return FiverrDecision("ignore", "follow_up_without_new_order")
+
+    if not is_seller_start:
+        return FiverrDecision("quarantine", "unrecognized_fiverr_template")
+    if not order_id:
+        return FiverrDecision("quarantine", "missing_order_id")
+
+    client_name = extract_client_name(email.subject, text) or "Fiverr Client"
+    due = extract_due_datetime(text, email.subject)
+    if not due:
+        return FiverrDecision("quarantine", "missing_due_date", FiverrOrder(order_id, client_name, datetime.now(tz=TZ), source, email.message_id, email.received_at))
+
+    return FiverrDecision(
+        "create",
+        "seller_order_started",
+        FiverrOrder(order_id, client_name, due, source, email.message_id, email.received_at),
+    )
 
 
 async def ensure_topic(application: Application, chat_id: int, client_name: str) -> Optional[int]:
@@ -620,6 +929,24 @@ async def ensure_topic(application: Application, chat_id: int, client_name: str)
         return topic.message_thread_id
     except Exception as exc:
         logging.warning("Failed to create topic: %s", exc)
+        return None
+
+
+def fiverr_topic_name(order: FiverrOrder) -> str:
+    suffix = f" - {order.order_id}"
+    max_client_len = max(1, 128 - len(suffix))
+    client = order.client_name[:max_client_len].rstrip()
+    return f"{client}{suffix}"
+
+
+async def create_fiverr_order_topic(application: Application, chat_id: int, order: FiverrOrder) -> Optional[int]:
+    topic_name = fiverr_topic_name(order)
+    try:
+        topic = await application.bot.create_forum_topic(chat_id=chat_id, name=topic_name)
+        save_topic(chat_id, topic_name, topic.message_thread_id)
+        return topic.message_thread_id
+    except Exception as exc:
+        logging.warning("Failed to create Fiverr order topic for %s: %s", order.order_id, exc)
         return None
 
 
@@ -637,11 +964,23 @@ async def handle_mailgun_inbound(request: web.Request, application: Application)
 
     subject = data.get("subject", "") or ""
     body = data.get("stripped-text", "") or data.get("body-plain", "") or ""
-    await process_inbound_order(application, subject, body, source="Mailgun")
+    email = InboundEmail(
+        subject=subject,
+        body=body,
+        html_body=data.get("stripped-html", "") or data.get("body-html", "") or "",
+        sender=sender,
+        message_id=data.get("Message-Id", "") or data.get("message-id", "") or "",
+    )
+    await process_inbound_email(application, email, source="Mailgun")
     return web.Response(status=200, text="ok")
 
 
 async def process_inbound_order(application: Application, subject: str, body: str, source: str) -> None:
+    email = InboundEmail(subject=subject, body=body)
+    await process_inbound_email(application, email, source)
+
+
+async def process_inbound_email(application: Application, email: InboundEmail, source: str) -> None:
     chat_id = get_setting("general_chat_id")
     if not chat_id:
         return
@@ -654,26 +993,58 @@ async def process_inbound_order(application: Application, subject: str, body: st
             chat_id=chat_id_int,
             text=f"⚠️ {source} order received, but owner is not set.\n"
                  "Run /task setowner.",
-        )
+            )
         return
 
-    client_name = extract_client_name(subject, body) or "Fiverr Client"
-    due = extract_due_datetime(body, subject)
-    if not due:
-        await application.bot.send_message(
-            chat_id=chat_id_int,
-            text=f"⚠️ {source} order received, but I couldn't parse the due date.\n"
-                 "Please create the task manually.",
+    decision = classify_fiverr_email(email, source)
+    order_id = decision.order.order_id if decision.order else extract_fiverr_order_id(email_search_text(email))
+    if decision.action == "ignore":
+        logging.info("Ignored %s inbound email: %s", source, decision.reason)
+        return
+    if decision.action == "quarantine" or not decision.order:
+        save_inbound_quarantine(
+            source=source,
+            message_id=email.message_id,
+            order_id=order_id,
+            reason=decision.reason,
+            subject=email.subject,
         )
+        logging.warning("Quarantined %s inbound email: %s", source, decision.reason)
         return
 
-    deadline_local = (due - timedelta(days=1)).astimezone(TZ)
+    order = decision.order
+    row, inserted = reserve_fiverr_order(order, chat_id_int)
+    if row and row["task_id"]:
+        logging.info("Duplicate Fiverr order %s ignored; task already exists", order.order_id)
+        return
+    if row and not inserted:
+        save_inbound_quarantine(
+            source=source,
+            message_id=email.message_id,
+            order_id=order.order_id,
+            reason="uncertain_create_retry",
+            subject=email.subject,
+        )
+        mark_fiverr_order_quarantined(order.order_id, "uncertain_create_retry")
+        logging.warning("Quarantined retry for incompletely created Fiverr order %s", order.order_id)
+        return
+
+    deadline_local = (order.due - timedelta(days=1)).astimezone(TZ)
     deadline_utc = deadline_local.astimezone(ZoneInfo("UTC"))
 
-    order_id = extract_order_id(subject + "\n" + body)
-    title = f"Fiverr order #{order_id}" if order_id else f"Fiverr order — {client_name}"
+    title = f"Fiverr order #{order.order_id}"
 
-    thread_id = await ensure_topic(application, chat_id_int, client_name)
+    thread_id = await create_fiverr_order_topic(application, chat_id_int, order)
+    if thread_id is None:
+        save_inbound_quarantine(
+            source=source,
+            message_id=email.message_id,
+            order_id=order.order_id,
+            reason="topic_create_failed",
+            subject=email.subject,
+        )
+        mark_fiverr_order_quarantined(order.order_id, "topic_create_failed")
+        return
 
     task_id = save_task(
         title=title,
@@ -683,6 +1054,7 @@ async def process_inbound_order(application: Application, subject: str, body: st
         chat_id=chat_id_int,
         thread_id=thread_id,
     )
+    mark_fiverr_order_created(order.order_id, task_id, thread_id)
 
     task = get_task(task_id, chat_id_int)
     if task:
@@ -720,8 +1092,17 @@ async def handle_gmail_webhook(request: web.Request, application: Application) -
         payload = {}
 
     subject = payload.get("subject", "") or ""
-    body = payload.get("body", "") or payload.get("text", "") or ""
-    await process_inbound_order(application, subject, body, source="Gmail")
+    body = payload.get("body", "") or payload.get("text", "") or payload.get("plainBody", "") or ""
+    email = InboundEmail(
+        subject=subject,
+        body=body,
+        html_body=payload.get("htmlBody", "") or payload.get("html", "") or "",
+        sender=payload.get("from", "") or payload.get("sender", "") or "",
+        message_id=payload.get("messageId", "") or payload.get("id", "") or "",
+        gmail_thread_id=payload.get("threadId", "") or "",
+        received_at=payload.get("date", "") or payload.get("receivedAt", "") or "",
+    )
+    await process_inbound_email(application, email, source="Gmail")
     return web.Response(status=200, text="ok")
 
 

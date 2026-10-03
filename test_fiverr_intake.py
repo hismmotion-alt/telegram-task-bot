@@ -61,10 +61,11 @@ class FakeApplication:
 
 
 class FakeTelegramMessage:
-    def __init__(self, chat_id, message_thread_id=None, text=""):
+    def __init__(self, chat_id, message_thread_id=None, text="", reply_to_message=None):
         self.chat_id = chat_id
         self.message_thread_id = message_thread_id
         self.text = text
+        self.reply_to_message = reply_to_message
         self.replies = []
 
     async def reply_text(self, text, **kwargs):
@@ -168,6 +169,21 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Complete", labels)
         self.assertIn("Open Fiverr", labels)
         self.assertEqual(urls, ["https://www.fiverr.com/users/funanimation1/manage_orders/FO1717171717"])
+
+    async def test_new_fiverr_task_created_message_enables_bottom_keyboard(self):
+        inbound = email(
+            "Great news: You've received an order from keyboardbuyer",
+            "You just received an order from keyboardbuyer.\nOrder #FO1717171718 is due Oct 9, 2026.",
+        )
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+
+        created_message = self.app.bot.messages[-3]
+        keyboard = created_message["reply_markup"]
+        labels = [button.text for row in keyboard.keyboard for button in row]
+        self.assertEqual(labels, [main.ORDER_CONTROLS_LABEL, main.DEADLINE_LABEL])
+        self.assertTrue(keyboard.resize_keyboard)
+        self.assertFalse(keyboard.one_time_keyboard)
+        self.assertTrue(keyboard.is_persistent)
 
     async def test_assignment_button_sets_assignee_and_confirms(self):
         main.save_task(
@@ -407,11 +423,206 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
 
         await main.cmd_order(update, context)
 
-        panel = self.app.bot.messages[-1]
+        panel = self.app.bot.messages[-2]
         self.assertEqual(panel["message_thread_id"], 555)
         self.assertIn(f"Task #{task_id}", panel["text"])
         labels = [button.text for row in panel["reply_markup"].inline_keyboard for button in row]
         self.assertIn("Mark submitted", labels)
+
+    async def test_order_command_enables_bottom_keyboard(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO1818181819",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=560,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=560, text="/order")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.cmd_order(update, context)
+
+        setup = self.app.bot.messages[-1]
+        self.assertEqual(setup["message_thread_id"], 560)
+        self.assertIn("Keyboard shortcuts enabled", setup["text"])
+        labels = [button.text for row in setup["reply_markup"].keyboard for button in row]
+        self.assertEqual(labels, [main.ORDER_CONTROLS_LABEL, main.DEADLINE_LABEL])
+        self.assertIn(f"Task #{task_id}", self.app.bot.messages[-2]["text"])
+
+    async def test_menu_command_enables_bottom_keyboard_without_task_lookup(self):
+        message = FakeTelegramMessage(-100123, message_thread_id=561, text="/menu")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.cmd_menu(update, context)
+
+        setup = self.app.bot.messages[-1]
+        self.assertEqual(setup["message_thread_id"], 561)
+        labels = [button.text for row in setup["reply_markup"].keyboard for button in row]
+        self.assertEqual(labels, [main.ORDER_CONTROLS_LABEL, main.DEADLINE_LABEL])
+
+    async def test_order_controls_shortcut_resolves_current_topic(self):
+        topic_a = main.save_task(
+            title="Fiverr order #FO2323232323",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=562,
+        )
+        topic_b = main.save_task(
+            title="Fiverr order #FO2424242424",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 10, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=563,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=563, text=main.ORDER_CONTROLS_LABEL)
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        handled = await main.handle_order_shortcut_message(update, context)
+
+        self.assertTrue(handled)
+        panel = self.app.bot.messages[-1]
+        self.assertNotIn(f"Task #{topic_a}", panel["text"])
+        self.assertIn(f"Task #{topic_b}", panel["text"])
+        self.assertEqual(panel["message_thread_id"], 563)
+
+    async def test_deadline_shortcut_is_read_only_and_topic_scoped(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO2525252525",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=564,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=564, text=main.DEADLINE_LABEL)
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        handled = await main.handle_order_shortcut_message(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertTrue(handled)
+        self.assertEqual(status, "assigned")
+        self.assertIn(f"Task #{task_id} deadline", message.replies[0][0])
+        labels = [button.text for row in message.replies[0][1]["reply_markup"].keyboard for button in row]
+        self.assertEqual(labels, [main.ORDER_CONTROLS_LABEL, main.DEADLINE_LABEL])
+
+    async def test_shortcut_missing_topic_task_does_not_use_global_last_task(self):
+        main.save_task(
+            title="Fiverr order #FO2626262626",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=565,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=999, text=main.ORDER_CONTROLS_LABEL)
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        handled = await main.handle_order_shortcut_message(update, context)
+
+        self.assertTrue(handled)
+        self.assertEqual(self.app.bot.messages, [])
+        self.assertIn("No open order task in this topic", message.replies[0][0])
+
+    async def test_shortcut_multiple_tasks_shows_selector(self):
+        task_a = main.save_task(
+            title="Fiverr order #FO2727272727",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=566,
+        )
+        task_b = main.save_task(
+            title="Fiverr order #FO2828282828",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 10, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=566,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=566, text=main.ORDER_CONTROLS_LABEL)
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        handled = await main.handle_order_shortcut_message(update, context)
+
+        self.assertTrue(handled)
+        self.assertEqual(self.app.bot.messages, [])
+        self.assertIn(f"/order <id>", message.replies[0][0])
+        self.assertIn(f"#{task_a}", message.replies[0][0])
+        self.assertIn(f"#{task_b}", message.replies[0][0])
+
+    async def test_shortcut_labels_do_not_disrupt_assignment_username_reply(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO2929292929",
+            assignee="@unassigned",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=567,
+        )
+        main.create_pending_assignment(
+            chat_id=-100123,
+            task_id=task_id,
+            thread_id=567,
+            owner_id=42,
+            prompt_message_id=321,
+        )
+        prompt = SimpleNamespace(message_id=321)
+        message = FakeTelegramMessage(-100123, message_thread_id=567, text="@designer", reply_to_message=prompt)
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.on_reply_message(update, context)
+
+        with main.get_db() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(task["assignee"], "@designer")
+        self.assertEqual(message.replies[0][0], "✅ Assigned to @designer.")
 
     async def test_order_submit_button_is_assignee_only_and_internal(self):
         task_id = main.save_task(

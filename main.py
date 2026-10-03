@@ -16,7 +16,7 @@ from dateutil import parser as date_parser
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 import random
@@ -28,6 +28,8 @@ HTTP_PORT = int(os.getenv("PORT", "8000"))
 MAILGUN_SIGNING_KEY = os.getenv("MAILGUN_SIGNING_KEY", "")
 MAILGUN_ALLOWED_SENDER = os.getenv("MAILGUN_ALLOWED_SENDER", "fiverr.com")
 GMAIL_WEBHOOK_TOKEN = os.getenv("GMAIL_WEBHOOK_TOKEN", "")
+ORDER_CONTROLS_LABEL = "Order controls"
+DEADLINE_LABEL = "Deadline"
 
 
 @dataclass
@@ -801,12 +803,33 @@ def task_assign_control_keyboard(task: Task, chat_id: int) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 
+def order_shortcuts_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[ORDER_CONTROLS_LABEL, DEADLINE_LABEL]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
+    )
+
+
 async def send_task_control_panel(bot, chat_id: int, task: Task) -> None:
     await bot.send_message(
         chat_id=chat_id,
         message_thread_id=task.thread_id,
         text=task_control_panel_text(task),
         reply_markup=task_control_keyboard(task, chat_id),
+    )
+
+
+async def send_order_shortcuts_setup(bot, chat_id: int, thread_id: Optional[int]) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        text=(
+            "Keyboard shortcuts enabled for this chat.\n"
+            f"Tap '{ORDER_CONTROLS_LABEL}' for the current topic panel or '{DEADLINE_LABEL}' for the current topic deadline."
+        ),
+        reply_markup=order_shortcuts_keyboard(),
     )
 
 
@@ -1344,8 +1367,9 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             message_thread_id=thread_id,
             text=f"🟡 Task #{task_id} created from {source}.\n"
                  f"👤 Unassigned | ⏰ {format_deadline_local(task.deadline_utc)}",
-            reply_markup=task_control_keyboard(task, chat_id_int),
+            reply_markup=order_shortcuts_keyboard(),
         )
+        await send_task_control_panel(application.bot, chat_id_int, task)
         assign_keyboard = assignment_keyboard(task_id, chat_id_int)
         assign_text = (
             f"{owner_username}, who should be assigned? Tap a name or reply with @username."
@@ -1421,6 +1445,37 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(random.choice(messages))
 
 
+def current_thread_id(update: Update) -> Optional[int]:
+    return update.effective_message.message_thread_id if update.effective_message else None
+
+
+def format_task_selector(tasks: list[Task]) -> str:
+    lines = [
+        f"{status_emoji(t.status)} #{t.id} — {t.title} ({status_label(t.status)})"
+        for t in tasks
+    ]
+    return "Multiple open tasks in this topic. Use /order <id>:\n" + "\n".join(lines)
+
+
+async def resolve_single_topic_task(update: Update) -> Optional[Task]:
+    if not update.effective_chat:
+        return None
+    tasks = list_open_tasks_by_thread(update.effective_chat.id, current_thread_id(update))
+    if not tasks:
+        await update.message.reply_text(
+            "📭 No open order task in this topic.",
+            reply_markup=order_shortcuts_keyboard(),
+        )
+        return None
+    if len(tasks) > 1:
+        await update.message.reply_text(
+            format_task_selector(tasks),
+            reply_markup=order_shortcuts_keyboard(),
+        )
+        return None
+    return tasks[0]
+
+
 async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -1438,24 +1493,43 @@ async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("❌ Task not found.")
             return
         await send_task_control_panel(context.bot, update.effective_chat.id, task)
+        await send_order_shortcuts_setup(context.bot, update.effective_chat.id, task.thread_id)
         return
 
-    thread_id = update.effective_message.message_thread_id if update.effective_message else None
-    tasks = list_open_tasks_by_thread(update.effective_chat.id, thread_id)
-    if not tasks:
-        await update.message.reply_text("📭 No open order task in this topic.")
-        return
-    if len(tasks) > 1:
-        lines = [
-            f"{status_emoji(t.status)} #{t.id} — {t.title} ({status_label(t.status)})"
-            for t in tasks
-        ]
-        await update.message.reply_text(
-            "Multiple open tasks in this topic. Use /order <id>:\n" + "\n".join(lines)
-        )
+    task = await resolve_single_topic_task(update)
+    if not task:
         return
 
-    await send_task_control_panel(context.bot, update.effective_chat.id, tasks[0])
+    await send_task_control_panel(context.bot, update.effective_chat.id, task)
+    await send_order_shortcuts_setup(context.bot, update.effective_chat.id, task.thread_id)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    await send_order_shortcuts_setup(context.bot, update.effective_chat.id, current_thread_id(update))
+
+
+async def handle_order_shortcut_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.message or not update.effective_chat:
+        return False
+    label = (update.message.text or "").strip()
+    if label not in {ORDER_CONTROLS_LABEL, DEADLINE_LABEL}:
+        return False
+
+    task = await resolve_single_topic_task(update)
+    if not task:
+        return True
+
+    if label == ORDER_CONTROLS_LABEL:
+        await send_task_control_panel(context.bot, update.effective_chat.id, task)
+        return True
+
+    await update.message.reply_text(
+        f"⏰ Task #{task.id} deadline:\n{deadline_detail(task.deadline_utc)}",
+        reply_markup=order_shortcuts_keyboard(),
+    )
+    return True
 
 
 async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1485,6 +1559,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/task setassignee @user\n"
             "/task setowner\n"
             "/order or /order <id>\n"
+            "/menu\n"
         )
         return
 
@@ -1868,6 +1943,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def on_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat or not update.effective_user:
         return
+    if await handle_order_shortcut_message(update, context):
+        return
     reply_to = update.message.reply_to_message
     if not reply_to:
         return
@@ -2146,6 +2223,7 @@ def main() -> None:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("task", cmd_task))
     application.add_handler(CommandHandler("order", cmd_order))
+    application.add_handler(CommandHandler("menu", cmd_menu))
     application.add_handler(CommandHandler("approve", cmd_approve))
     application.add_handler(CallbackQueryHandler(on_callback_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_reply_message))

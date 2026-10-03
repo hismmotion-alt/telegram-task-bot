@@ -329,6 +329,17 @@ def get_task(task_id: int, chat_id: int) -> Optional[Task]:
         return task_from_row(row) if row else None
 
 
+def get_fiverr_order_by_task(task_id: int, chat_id: int) -> Optional[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM fiverr_orders
+            WHERE task_id = ? AND chat_id = ? AND status = 'created'
+            """,
+            (task_id, chat_id),
+        ).fetchone()
+
+
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_chat or not update.effective_user:
         return False
@@ -698,6 +709,105 @@ def assignment_keyboard(task_id: int, chat_id: int) -> Optional[InlineKeyboardMa
         for assignee in recent_assignees(chat_id)
     ]
     return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def fiverr_order_url(order_id: str) -> str:
+    return f"https://www.fiverr.com/users/funanimation1/manage_orders/{order_id}"
+
+
+def deadline_detail(deadline_utc: datetime, now: Optional[datetime] = None) -> str:
+    now_utc = (now or datetime.now(tz=ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
+    deadline_utc = deadline_utc.astimezone(ZoneInfo("UTC"))
+    remaining = deadline_utc - now_utc
+    total_seconds = int(abs(remaining.total_seconds()))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+
+    if days:
+        amount = f"{days}d {hours}h"
+    elif hours:
+        amount = f"{hours}h {minutes}m"
+    else:
+        amount = f"{minutes}m"
+
+    local = format_deadline_local(deadline_utc)
+    if remaining.total_seconds() < 0:
+        return f"{local} — overdue by {amount}"
+    return f"{local} — {amount} remaining"
+
+
+def task_control_panel_text(task: Task) -> str:
+    assignee = task.assignee if task.assignee != "@unassigned" else "Unassigned"
+    return (
+        f"{status_emoji(task.status)} Task #{task.id}\n"
+        f"{task.title}\n"
+        f"Status: {status_label(task.status)}\n"
+        f"Assignee: {assignee}\n"
+        f"Deadline: {deadline_detail(task.deadline_utc)}"
+    )
+
+
+def task_control_keyboard(task: Task, chat_id: int, confirm_done: bool = False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if confirm_done:
+        rows.append(
+            [
+                InlineKeyboardButton("✅ Yes, complete", callback_data=f"order_ctl:{task.id}:done"),
+                InlineKeyboardButton("Cancel", callback_data=f"order_ctl:{task.id}:refresh"),
+            ]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    if task.status not in {"done", "sent_to_client"}:
+        if task.assignee != "@unassigned" and task.status in {"assigned", "blocked", "revision"}:
+            rows.append(
+                [
+                    InlineKeyboardButton("Start", callback_data=f"order_ctl:{task.id}:start"),
+                    InlineKeyboardButton("Need details", callback_data=f"order_ctl:{task.id}:blocked"),
+                ]
+            )
+        if task.assignee != "@unassigned" and task.status in {"assigned", "in_progress", "revision"}:
+            rows.append([InlineKeyboardButton("Mark submitted", callback_data=f"order_ctl:{task.id}:submit")])
+        rows.append([InlineKeyboardButton("Complete", callback_data=f"order_ctl:{task.id}:confirm_done")])
+
+    rows.append([InlineKeyboardButton("Deadline", callback_data=f"order_ctl:{task.id}:deadline")])
+
+    assignees = recent_assignees(chat_id, limit=1)
+    assign_label = "Reassign" if task.assignee != "@unassigned" else "Assign"
+    if assignees:
+        rows.append([InlineKeyboardButton(assign_label, callback_data=f"order_ctl:{task.id}:assign_menu")])
+
+    order = get_fiverr_order_by_task(task.id, chat_id)
+    if order:
+        rows.append([InlineKeyboardButton("Open Fiverr", url=fiverr_order_url(order["order_id"]))])
+
+    rows.append([InlineKeyboardButton("Refresh", callback_data=f"order_ctl:{task.id}:refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+def task_assign_control_keyboard(task: Task, chat_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                assignee,
+                callback_data=f"order_assign:{task.id}:{assignee.lstrip('@')}",
+            )
+        ]
+        for assignee in recent_assignees(chat_id)
+    ]
+    rows.append([InlineKeyboardButton("Cancel", callback_data=f"order_ctl:{task.id}:refresh")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_task_control_panel(bot, chat_id: int, task: Task) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=task.thread_id,
+        text=task_control_panel_text(task),
+        reply_markup=task_control_keyboard(task, chat_id),
+    )
 
 
 async def send_assignee_prompt_to_chat(
@@ -1234,6 +1344,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             message_thread_id=thread_id,
             text=f"🟡 Task #{task_id} created from {source}.\n"
                  f"👤 Unassigned | ⏰ {format_deadline_local(task.deadline_utc)}",
+            reply_markup=task_control_keyboard(task, chat_id_int),
         )
         assign_keyboard = assignment_keyboard(task_id, chat_id_int)
         assign_text = (
@@ -1310,6 +1421,43 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(random.choice(messages))
 
 
+async def cmd_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) > 1:
+        try:
+            task_id = int(parts[1].strip())
+        except ValueError:
+            await update.message.reply_text("ℹ️ Usage: /order or /order <task_id>")
+            return
+        task = get_task(task_id, update.effective_chat.id)
+        if not task:
+            await update.message.reply_text("❌ Task not found.")
+            return
+        await send_task_control_panel(context.bot, update.effective_chat.id, task)
+        return
+
+    thread_id = update.effective_message.message_thread_id if update.effective_message else None
+    tasks = list_open_tasks_by_thread(update.effective_chat.id, thread_id)
+    if not tasks:
+        await update.message.reply_text("📭 No open order task in this topic.")
+        return
+    if len(tasks) > 1:
+        lines = [
+            f"{status_emoji(t.status)} #{t.id} — {t.title} ({status_label(t.status)})"
+            for t in tasks
+        ]
+        await update.message.reply_text(
+            "Multiple open tasks in this topic. Use /order <id>:\n" + "\n".join(lines)
+        )
+        return
+
+    await send_task_control_panel(context.bot, update.effective_chat.id, tasks[0])
+
+
 async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -1336,6 +1484,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/task setgeneral\n"
             "/task setassignee @user\n"
             "/task setowner\n"
+            "/order or /order <id>\n"
         )
         return
 
@@ -1388,7 +1537,8 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         await update.message.reply_text(
-            f"🟡 Task #{task_id} created. Deadline {format_deadline_local(deadline_utc)}"
+            f"🟡 Task #{task_id} created. Deadline {format_deadline_local(deadline_utc)}",
+            reply_markup=task_control_keyboard(task, update.effective_chat.id) if task else None,
         )
         return
 
@@ -1590,6 +1740,14 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     query = update.callback_query
     data = query.data or ""
+    if data.startswith("order_ctl:"):
+        await handle_order_control_callback(update, context)
+        return
+
+    if data.startswith("order_assign:"):
+        await handle_order_assign_callback(update, context)
+        return
+
     if data.startswith("task_ack:"):
         try:
             _, task_id_str, choice = data.split(":", 2)
@@ -1745,6 +1903,209 @@ async def on_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+def callback_chat_id(query) -> int:
+    return query.message.chat_id if query.message else 0
+
+
+def callback_thread_id(query) -> Optional[int]:
+    return getattr(query.message, "message_thread_id", None) if query.message else None
+
+
+def callback_matches_task_thread(query, task: Task) -> bool:
+    message_thread_id = callback_thread_id(query)
+    return message_thread_id is None or task.thread_id == message_thread_id
+
+
+def is_task_assignee(task: Task, username: Optional[str]) -> bool:
+    return task.assignee != "@unassigned" and (username or "").lower() == task.assignee.lstrip("@").lower()
+
+
+async def user_can_manage_task(user_id: int, task: Task, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if user_id == task.creator_id:
+        return True
+    try:
+        member = await context.bot.get_chat_member(task.chat_id, user_id)
+    except Exception:
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+async def edit_task_control_message(query, task: Task, chat_id: int, confirm_done: bool = False) -> None:
+    await query.edit_message_text(
+        text=task_control_panel_text(task),
+        reply_markup=task_control_keyboard(task, chat_id, confirm_done=confirm_done),
+    )
+
+
+async def handle_order_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    try:
+        _, task_id_str, action = (query.data or "").split(":", 2)
+        task_id = int(task_id_str)
+    except Exception:
+        await query.answer("⚠️ Invalid action.", show_alert=True)
+        return
+
+    chat_id = callback_chat_id(query)
+    task = get_task(task_id, chat_id)
+    if not task:
+        await query.answer("❌ Task not found.", show_alert=True)
+        return
+    if not callback_matches_task_thread(query, task):
+        await query.answer("⚠️ This button belongs to a different topic.", show_alert=True)
+        return
+
+    username = update.effective_user.username
+
+    if action == "refresh":
+        await query.answer("Updated")
+        await edit_task_control_message(query, task, chat_id)
+        return
+
+    if action == "deadline":
+        await query.answer(deadline_detail(task.deadline_utc), show_alert=True)
+        return
+
+    if action == "assign_menu":
+        if not await user_can_manage_task(update.effective_user.id, task, context):
+            await query.answer("🛡️ Only the task creator or an admin can assign this.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            text=f"Choose assignee for task #{task.id}:",
+            reply_markup=task_assign_control_keyboard(task, chat_id),
+        )
+        return
+
+    if action == "confirm_done":
+        if task.status == "done":
+            await query.answer("Already completed.", show_alert=True)
+            await edit_task_control_message(query, task, chat_id)
+            return
+        if not await user_can_manage_task(update.effective_user.id, task, context):
+            await query.answer("🛡️ Only the task creator or an admin can complete this.", show_alert=True)
+            return
+        await query.answer("Confirm completion")
+        await edit_task_control_message(query, task, chat_id, confirm_done=True)
+        return
+
+    if action == "done":
+        if task.status == "done":
+            await query.answer("Already completed.", show_alert=True)
+            await edit_task_control_message(query, task, chat_id)
+            return
+        if not await user_can_manage_task(update.effective_user.id, task, context):
+            await query.answer("🛡️ Only the task creator or an admin can complete this.", show_alert=True)
+            return
+        marked = mark_task_done(task.id, chat_id)
+        if not marked:
+            await query.answer("❌ Task not found.", show_alert=True)
+            return
+        cancel_task_jobs(context.application, task.id)
+        refreshed = get_task(task.id, chat_id) or task
+        await query.answer("Completed")
+        await edit_task_control_message(query, refreshed, chat_id)
+        await query.message.reply_text("✅ Task completed.\nGreat work 👏", message_thread_id=task.thread_id)
+        return
+
+    if action in {"start", "blocked", "submit"}:
+        if not is_task_assignee(task, username):
+            await query.answer("🧑‍💻 Only the assignee can use this.", show_alert=True)
+            return
+        if task.status == "done":
+            await query.answer("This task is already completed.", show_alert=True)
+            await edit_task_control_message(query, task, chat_id)
+            return
+
+    if action == "start":
+        if task.status == "in_progress":
+            await query.answer("Already in progress.", show_alert=True)
+            return
+        set_task_status(task.id, chat_id, "in_progress")
+        refreshed = get_task(task.id, chat_id) or task
+        await query.answer("Started")
+        await edit_task_control_message(query, refreshed, chat_id)
+        await query.message.reply_text("🔵 Task in progress.\nGood luck 🚀", message_thread_id=task.thread_id)
+        return
+
+    if action == "blocked":
+        if task.status == "blocked":
+            await query.answer("Already marked as needing details.", show_alert=True)
+            return
+        set_task_status(task.id, chat_id, "blocked")
+        refreshed = get_task(task.id, chat_id) or task
+        creator_mention = f'<a href="tg://user?id={task.creator_id}">task creator</a>'
+        await query.answer("Marked as needing details")
+        await edit_task_control_message(query, refreshed, chat_id)
+        await query.message.reply_text(
+            f"🔴 Task blocked.\nWaiting for more details from {creator_mention} 🤔",
+            parse_mode=ParseMode.HTML,
+            message_thread_id=task.thread_id,
+        )
+        return
+
+    if action == "submit":
+        if task.status in {"submitted", "sent_to_client"}:
+            await query.answer("Already submitted.", show_alert=True)
+            await edit_task_control_message(query, task, chat_id)
+            return
+        set_task_status(task.id, chat_id, "submitted")
+        refreshed = get_task(task.id, chat_id) or task
+        await query.answer("Submitted internally")
+        await edit_task_control_message(query, refreshed, chat_id)
+        await query.message.reply_text(
+            "🟣 Task submitted in Telegram. This does not deliver anything to Fiverr.",
+            reply_markup=task_delivery_keyboard(task.id),
+            message_thread_id=task.thread_id,
+        )
+        return
+
+    await query.answer("⚠️ Unknown action.", show_alert=True)
+
+
+async def handle_order_assign_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
+        return
+    try:
+        _, task_id_str, username = (query.data or "").split(":", 2)
+        task_id = int(task_id_str)
+    except Exception:
+        await query.answer("⚠️ Invalid assignment.", show_alert=True)
+        return
+
+    chat_id = callback_chat_id(query)
+    task = get_task(task_id, chat_id)
+    if not task:
+        await query.answer("❌ Task not found.", show_alert=True)
+        return
+    if not callback_matches_task_thread(query, task):
+        await query.answer("⚠️ This button belongs to a different topic.", show_alert=True)
+        return
+    if not await user_can_manage_task(update.effective_user.id, task, context):
+        await query.answer("🛡️ Only the task creator or an admin can assign this.", show_alert=True)
+        return
+
+    assignee = f"@{username}"
+    if task.assignee == assignee:
+        await query.answer(f"Already assigned to {assignee}", show_alert=True)
+        await edit_task_control_message(query, task, chat_id)
+        return
+
+    set_task_assignee(task.id, chat_id, assignee)
+    refreshed = get_task(task.id, chat_id)
+    if not refreshed:
+        await query.answer("❌ Task not found.", show_alert=True)
+        return
+
+    await query.answer(f"Assigned to {assignee}")
+    await edit_task_control_message(query, refreshed, chat_id)
+    await query.message.reply_text(f"✅ Assigned to {assignee}.", message_thread_id=task.thread_id)
+    await send_assignee_prompt_to_chat(context.bot, chat_id, task.thread_id, refreshed)
+
+
 async def on_startup(app: Application) -> None:
     # Reschedule reminders for existing open tasks
     with get_db() as conn:
@@ -1784,6 +2145,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("task", cmd_task))
+    application.add_handler(CommandHandler("order", cmd_order))
     application.add_handler(CommandHandler("approve", cmd_approve))
     application.add_handler(CallbackQueryHandler(on_callback_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_reply_message))

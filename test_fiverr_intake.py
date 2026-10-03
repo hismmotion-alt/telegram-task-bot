@@ -13,10 +13,21 @@ import main
 
 class FakeJobQueue:
     def __init__(self):
-        self.jobs = []
+        self._jobs = []
 
     def run_once(self, callback, when, data, name):
-        self.jobs.append((callback, when, data, name))
+        job = SimpleNamespace(
+            callback=callback,
+            when=when,
+            data=data,
+            name=name,
+            removed=False,
+        )
+        job.schedule_removal = lambda: setattr(job, "removed", True)
+        self._jobs.append(job)
+
+    def jobs(self):
+        return self._jobs
 
 
 class FakeBot:
@@ -38,6 +49,10 @@ class FakeBot:
         self.messages.append(kwargs)
         return SimpleNamespace(message_id=self.next_message_id)
 
+    async def get_chat_member(self, chat_id, user_id):
+        status = main.ChatMemberStatus.ADMINISTRATOR if user_id == 42 else main.ChatMemberStatus.MEMBER
+        return SimpleNamespace(status=status)
+
 
 class FakeApplication:
     def __init__(self, fail_topic=False):
@@ -46,8 +61,10 @@ class FakeApplication:
 
 
 class FakeTelegramMessage:
-    def __init__(self, chat_id):
+    def __init__(self, chat_id, message_thread_id=None, text=""):
         self.chat_id = chat_id
+        self.message_thread_id = message_thread_id
+        self.text = text
         self.replies = []
 
     async def reply_text(self, text, **kwargs):
@@ -56,17 +73,21 @@ class FakeTelegramMessage:
 
 
 class FakeCallbackQuery:
-    def __init__(self, data, chat_id):
+    def __init__(self, data, chat_id, message_thread_id=None):
         self.data = data
-        self.message = FakeTelegramMessage(chat_id)
+        self.message = FakeTelegramMessage(chat_id, message_thread_id=message_thread_id)
         self.answers = []
         self.markup_removed = False
+        self.edits = []
 
     async def answer(self, text=None, **kwargs):
         self.answers.append((text, kwargs))
 
     async def edit_message_reply_markup(self, reply_markup=None):
         self.markup_removed = reply_markup is None
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edits.append((text, kwargs))
 
 
 def email(subject, body="", html_body="", message_id="msg-1"):
@@ -131,6 +152,22 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Tap a name or reply with @username.", assignment_prompt["text"])
         self.assertEqual(keyboard[0][0].text, "@designer")
         self.assertRegex(keyboard[0][0].callback_data, r"^task_assign:\d+:designer$")
+
+    async def test_new_fiverr_task_created_message_has_control_panel(self):
+        inbound = email(
+            "Great news: You've received an order from panelbuyer",
+            "You just received an order from panelbuyer.\nOrder #FO1717171717 is due Oct 9, 2026.",
+        )
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+
+        created_message = self.app.bot.messages[-2]
+        keyboard = created_message["reply_markup"].inline_keyboard
+        labels = [button.text for row in keyboard for button in row]
+        urls = [button.url for row in keyboard for button in row if button.url]
+        self.assertIn("Deadline", labels)
+        self.assertIn("Complete", labels)
+        self.assertIn("Open Fiverr", labels)
+        self.assertEqual(urls, ["https://www.fiverr.com/users/funanimation1/manage_orders/FO1717171717"])
 
     async def test_assignment_button_sets_assignee_and_confirms(self):
         main.save_task(
@@ -350,6 +387,138 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
             reasons = conn.execute("SELECT reason FROM inbound_quarantine ORDER BY id").fetchall()
         self.assertEqual([row["reason"] for row in reasons], ["topic_create_failed", "uncertain_create_retry"])
+
+    async def test_order_command_opens_existing_topic_panel(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO1818181818",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=555,
+        )
+        message = FakeTelegramMessage(-100123, message_thread_id=555, text="/order")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.cmd_order(update, context)
+
+        panel = self.app.bot.messages[-1]
+        self.assertEqual(panel["message_thread_id"], 555)
+        self.assertIn(f"Task #{task_id}", panel["text"])
+        labels = [button.text for row in panel["reply_markup"].inline_keyboard for button in row]
+        self.assertIn("Mark submitted", labels)
+
+    async def test_order_submit_button_is_assignee_only_and_internal(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO1919191919",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=556,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:submit", -100123, message_thread_id=556)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertEqual(status, "submitted")
+        self.assertIn("Submitted internally", query.answers[0][0])
+        self.assertIn("does not deliver anything to Fiverr", query.message.replies[0][0])
+
+    async def test_order_submit_button_rejects_non_assignee(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO2020202020",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=557,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:submit", -100123, message_thread_id=557)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=100, username="someoneelse"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertEqual(status, "assigned")
+        self.assertEqual(query.answers[0][0], "🧑‍💻 Only the assignee can use this.")
+
+    async def test_complete_button_requires_confirmation_and_creator(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO2121212121",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=558,
+        )
+        task = main.get_task(task_id, -100123)
+        await main.schedule_task_jobs(self.app, task)
+
+        confirm_query = FakeCallbackQuery(f"order_ctl:{task_id}:confirm_done", -100123, message_thread_id=558)
+        update = SimpleNamespace(
+            callback_query=confirm_query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+        self.assertIn("Confirm completion", confirm_query.answers[0][0])
+        confirm_labels = [
+            button.text
+            for row in confirm_query.edits[0][1]["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("✅ Yes, complete", confirm_labels)
+
+        done_query = FakeCallbackQuery(f"order_ctl:{task_id}:done", -100123, message_thread_id=558)
+        update.callback_query = done_query
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertEqual(status, "done")
+        self.assertTrue(all(job.removed for job in self.app.job_queue.jobs()))
+        self.assertEqual(done_query.message.replies[0][0], "✅ Task completed.\nGreat work 👏")
+
+    async def test_order_button_rejects_cross_topic_click(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO2222222223",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, 15, 52, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=559,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:start", -100123, message_thread_id=999)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
+        self.assertEqual(status, "assigned")
+        self.assertEqual(query.answers[0][0], "⚠️ This button belongs to a different topic.")
 
 
 class AppsScriptDraftTests(unittest.TestCase):

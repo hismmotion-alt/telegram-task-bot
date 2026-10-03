@@ -216,6 +216,54 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM fiverr_orders").fetchone()[0], 0)
         self.assertEqual(len(self.app.bot.created_topics), 0)
 
+    async def test_requirements_received_creates_from_waiting_requirements_due(self):
+        waiting = email(
+            "Get aligned before your project even begins",
+            "Your order FO3232A942587 with Joseph A. due on Oct 9, 2026 is waiting for requirements.",
+            html_body='<a href="https://fiverr.com/orders/FO3232A942587?email_name=work_plan_order_created">Create timeline</a>',
+            message_id="waiting",
+        )
+        active = email(
+            "Requirements are in. Now it's time to share a timeline.",
+            "Joseph A. has sent the requirements and your order FO3232A942587 is now in progress.\n"
+            "1. Could you please let me know which format you would prefer for the final animation?\n"
+            ".riv .rev or rive link",
+            html_body='<a href="https://fiverr.com/orders/FO3232A942587?email_name=work_plan_order_requirements_received">Review and create timeline</a>',
+            message_id="active",
+        )
+
+        await main.process_inbound_email(self.app, waiting, "Gmail")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            pending = conn.execute("SELECT * FROM pending_fiverr_requirement_orders").fetchone()
+        self.assertEqual(pending["order_id"], "FO3232A942587")
+        self.assertEqual(pending["client_name"], "Joseph A")
+
+        await main.process_inbound_email(self.app, active, "Gmail")
+        with main.get_db() as conn:
+            tasks = conn.execute("SELECT * FROM tasks").fetchall()
+            orders = conn.execute("SELECT * FROM fiverr_orders").fetchall()
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["title"], "Fiverr order #FO3232A942587")
+        self.assertEqual(orders[0]["order_id"], "FO3232A942587")
+        self.assertEqual(orders[0]["client_name"], "Joseph A")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertIn("FO3232A942587", self.app.bot.created_topics[0][1])
+
+    async def test_requirements_received_without_due_evidence_is_quarantined(self):
+        active = email(
+            "Requirements are in. Now it's time to share a timeline.",
+            "Standalone Buyer has sent the requirements and your order FO5656565656 is now in progress.",
+            html_body='<a href="https://fiverr.com/orders/FO5656565656?email_name=work_plan_order_requirements_received">Review and create timeline</a>',
+            message_id="active-no-due",
+        )
+        await main.process_inbound_email(self.app, active, "Gmail")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            row = conn.execute("SELECT * FROM inbound_quarantine").fetchone()
+        self.assertEqual(row["order_id"], "FO5656565656")
+        self.assertEqual(row["reason"], "missing_due_date")
+
     async def test_buyer_receipt_and_delivery_are_ignored(self):
         buyer = email(
             "Fiverr / Shopping / Status of your order No. FO6666666666",

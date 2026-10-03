@@ -170,6 +170,21 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_fiverr_requirement_orders (
+                order_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                client_name TEXT NOT NULL,
+                due_utc TEXT NOT NULL,
+                source TEXT NOT NULL,
+                first_message_id TEXT,
+                gmail_thread_id TEXT,
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL
+            )
+            """
+        )
         # Add message_thread_id column for existing DBs
         cols = [row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()]
         if "message_thread_id" not in cols:
@@ -586,6 +601,44 @@ def save_inbound_quarantine(
         )
 
 
+def save_pending_fiverr_requirement_order(order: FiverrOrder, chat_id: int, gmail_thread_id: str) -> None:
+    now = datetime.now(tz=ZoneInfo("UTC")).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO pending_fiverr_requirement_orders
+            (order_id, chat_id, client_name, due_utc, source, first_message_id, gmail_thread_id, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET
+                client_name = excluded.client_name,
+                due_utc = excluded.due_utc,
+                source = excluded.source,
+                first_message_id = COALESCE(NULLIF(excluded.first_message_id, ''), first_message_id),
+                gmail_thread_id = COALESCE(NULLIF(excluded.gmail_thread_id, ''), gmail_thread_id),
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                order.order_id,
+                chat_id,
+                order.client_name,
+                order.due.astimezone(ZoneInfo("UTC")).isoformat(),
+                order.source,
+                order.message_id,
+                gmail_thread_id,
+                now,
+                now,
+            ),
+        )
+
+
+def get_pending_fiverr_requirement_order(order_id: str) -> Optional[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM pending_fiverr_requirement_orders WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+
+
 def get_topic_thread_id(chat_id: int, name: str) -> Optional[int]:
     with get_db() as conn:
         row = conn.execute(
@@ -833,6 +886,7 @@ def extract_client_name(subject: str, body: str) -> Optional[str]:
         r"(?i)you'?ve received an order from\s+(.+)",
         r"(?i)great news:\s*you'?ve received an order from\s+(.+)",
         r"(?i)\byour order\s+FO[A-Z0-9]+\s+with\s+(.+?)\s+due\b",
+        r"(?i)^(.+?)\s+has sent the requirements and your order\b",
         r"(?i)buyer[:\-]\s*(.+)",
         r"(?i)client[:\-]\s*(.+)",
         r"(?i)from[:\-]\s*(.+)",
@@ -946,10 +1000,48 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
         or any(phrase in normalized for phrase in seller_start_phrases)
     )
 
-    follow_up_markers = [
-        "view_requirements_reminder",
+    is_requirements_received = (
+        email_name == "work_plan_order_requirements_received"
+        or (
+            "has sent the requirements and your order" in normalized
+            and "is now in progress" in normalized
+        )
+    )
+    if not is_seller_start and is_requirements_received:
+        if not order_id:
+            return FiverrDecision("quarantine", "missing_order_id")
+        client_name = extract_client_name(email.subject, text) or "Fiverr Client"
+        due = extract_due_datetime(text, email.subject)
+        if due:
+            return FiverrDecision(
+                "create",
+                "requirements_received_order_started",
+                FiverrOrder(order_id, client_name, due, source, email.message_id, email.received_at),
+            )
+        return FiverrDecision(
+            "create_after_requirements",
+            "requirements_received_missing_due",
+            FiverrOrder(order_id, client_name, datetime.now(tz=TZ), source, email.message_id, email.received_at),
+        )
+
+    waiting_for_requirements_markers = [
         "work_plan_order_created",
         "waiting for requirements",
+    ]
+    if not is_seller_start and any(marker in email_name or marker in normalized for marker in waiting_for_requirements_markers):
+        if order_id:
+            client_name = extract_client_name(email.subject, text) or "Fiverr Client"
+            due = extract_due_datetime(text, email.subject)
+            if due:
+                return FiverrDecision(
+                    "defer",
+                    "waiting_for_requirements",
+                    FiverrOrder(order_id, client_name, due, source, email.message_id, email.received_at),
+                )
+        return FiverrDecision("ignore", "follow_up_without_new_order")
+
+    follow_up_markers = [
+        "view_requirements_reminder",
     ]
     if not is_seller_start and any(marker in email_name or marker in normalized for marker in follow_up_markers):
         return FiverrDecision("ignore", "follow_up_without_new_order")
@@ -1053,6 +1145,32 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
     if decision.action == "ignore":
         logging.info("Ignored %s inbound email: %s", source, decision.reason)
         return
+    if decision.action == "defer" and decision.order:
+        save_pending_fiverr_requirement_order(decision.order, chat_id_int, email.gmail_thread_id)
+        logging.info("Deferred %s Fiverr order %s until requirements arrive", source, decision.order.order_id)
+        return
+    if decision.action == "create_after_requirements" and decision.order:
+        pending = get_pending_fiverr_requirement_order(decision.order.order_id)
+        if pending:
+            decision.order = FiverrOrder(
+                order_id=decision.order.order_id,
+                client_name=pending["client_name"] or decision.order.client_name,
+                due=datetime.fromisoformat(pending["due_utc"]).astimezone(TZ),
+                source=source,
+                message_id=decision.order.message_id,
+                received_at=decision.order.received_at,
+            )
+            decision = FiverrDecision("create", "requirements_received_order_started", decision.order)
+        else:
+            save_inbound_quarantine(
+                source=source,
+                message_id=email.message_id,
+                order_id=decision.order.order_id,
+                reason="missing_due_date",
+                subject=email.subject,
+            )
+            logging.warning("Quarantined %s inbound email: missing due date for requirements-received order", source)
+            return
     if decision.action == "quarantine" or not decision.order:
         save_inbound_quarantine(
             source=source,

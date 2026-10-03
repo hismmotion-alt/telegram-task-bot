@@ -45,6 +45,30 @@ class FakeApplication:
         self.job_queue = FakeJobQueue()
 
 
+class FakeTelegramMessage:
+    def __init__(self, chat_id):
+        self.chat_id = chat_id
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+        return SimpleNamespace(message_id=900 + len(self.replies))
+
+
+class FakeCallbackQuery:
+    def __init__(self, data, chat_id):
+        self.data = data
+        self.message = FakeTelegramMessage(chat_id)
+        self.answers = []
+        self.markup_removed = False
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+    async def edit_message_reply_markup(self, reply_markup=None):
+        self.markup_removed = reply_markup is None
+
+
 def email(subject, body="", html_body="", message_id="msg-1"):
     return main.InboundEmail(
         subject=subject,
@@ -86,6 +110,64 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["order_id"], "FO1234567890")
         self.assertEqual(len(tasks), 1)
+
+    async def test_fiverr_assignment_prompt_includes_recent_assignee_button(self):
+        main.save_task(
+            title="Recent task",
+            assignee="@designer",
+            deadline_utc=datetime.now(tz=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        inbound = email(
+            "Great news: You've received an order from buttonbuyer",
+            "You just received an order from buttonbuyer.\nOrder #FO1515151515 is due Oct 9, 2026.",
+        )
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+
+        assignment_prompt = self.app.bot.messages[-1]
+        keyboard = assignment_prompt["reply_markup"].inline_keyboard
+        self.assertIn("Tap a name or reply with @username.", assignment_prompt["text"])
+        self.assertEqual(keyboard[0][0].text, "@designer")
+        self.assertRegex(keyboard[0][0].callback_data, r"^task_assign:\d+:designer$")
+
+    async def test_assignment_button_sets_assignee_and_confirms(self):
+        main.save_task(
+            title="Recent task",
+            assignee="@designer",
+            deadline_utc=datetime.now(tz=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        inbound = email(
+            "Great news: You've received an order from assignbutton",
+            "You just received an order from assignbutton.\nOrder #FO1616161616 is due Oct 9, 2026.",
+        )
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+
+        assignment_prompt = self.app.bot.messages[-1]
+        callback_data = assignment_prompt["reply_markup"].inline_keyboard[0][0].callback_data
+        query = FakeCallbackQuery(callback_data, -100123)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE title = 'Fiverr order #FO1616161616'"
+            ).fetchone()
+            pending_count = conn.execute("SELECT COUNT(*) FROM pending_assignments").fetchone()[0]
+        self.assertEqual(task["assignee"], "@designer")
+        self.assertEqual(pending_count, 0)
+        self.assertTrue(query.markup_removed)
+        self.assertEqual(query.message.replies[0][0], "✅ Assigned to @designer.")
+        self.assertIn("Assigned to @designer", query.answers[0][0])
 
     async def test_repeat_same_message_does_not_create_duplicate(self):
         inbound = email(

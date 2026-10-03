@@ -448,12 +448,51 @@ def get_pending_assignment_by_prompt(chat_id: int, prompt_message_id: int) -> Op
         ).fetchone()
 
 
+def get_pending_assignment_by_task(chat_id: int, task_id: int) -> Optional[sqlite3.Row]:
+    with get_db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM pending_assignments
+            WHERE chat_id = ? AND task_id = ?
+            """,
+            (chat_id, task_id),
+        ).fetchone()
+
+
 def clear_pending_assignment(chat_id: int, task_id: int) -> None:
     with get_db() as conn:
         conn.execute(
             "DELETE FROM pending_assignments WHERE chat_id = ? AND task_id = ?",
             (chat_id, task_id),
         )
+
+
+def recent_assignees(chat_id: int, limit: int = 5) -> list[str]:
+    assignees: list[str] = []
+    default_assignee = get_setting("default_assignee")
+    if default_assignee and default_assignee != "@unassigned":
+        assignees.append(default_assignee)
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT assignee
+            FROM tasks
+            WHERE chat_id = ? AND assignee != '@unassigned'
+            GROUP BY assignee
+            ORDER BY MAX(id) DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+
+    for row in rows:
+        assignee = row["assignee"]
+        if assignee not in assignees:
+            assignees.append(assignee)
+        if len(assignees) >= limit:
+            break
+    return assignees
 
 
 def reserve_fiverr_order(order: FiverrOrder, chat_id: int) -> tuple[Optional[sqlite3.Row], bool]:
@@ -593,6 +632,19 @@ def task_delivery_keyboard(task_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def assignment_keyboard(task_id: int, chat_id: int) -> Optional[InlineKeyboardMarkup]:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                assignee,
+                callback_data=f"task_assign:{task_id}:{assignee.lstrip('@')}",
+            )
+        ]
+        for assignee in recent_assignees(chat_id)
+    ]
+    return InlineKeyboardMarkup(buttons) if buttons else None
 
 
 async def send_assignee_prompt_to_chat(
@@ -1065,10 +1117,17 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             text=f"🟡 Task #{task_id} created from {source}.\n"
                  f"👤 Unassigned | ⏰ {format_deadline_local(task.deadline_utc)}",
         )
+        assign_keyboard = assignment_keyboard(task_id, chat_id_int)
+        assign_text = (
+            f"{owner_username}, who should be assigned? Tap a name or reply with @username."
+            if assign_keyboard
+            else f"{owner_username}, who should be assigned? Reply with @username."
+        )
         prompt = await application.bot.send_message(
             chat_id=chat_id_int,
             message_thread_id=thread_id,
-            text=f"{owner_username}, who should be assigned? Reply with @username.",
+            text=assign_text,
+            reply_markup=assign_keyboard,
         )
         create_pending_assignment(
             chat_id=chat_id_int,
@@ -1487,6 +1546,46 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return
 
+        return
+
+    if data.startswith("task_assign:"):
+        try:
+            _, task_id_str, username = data.split(":", 2)
+            task_id = int(task_id_str)
+        except Exception:
+            await query.answer("⚠️ Invalid assignment.", show_alert=True)
+            return
+
+        chat_id = query.message.chat_id if query.message else 0
+        pending = get_pending_assignment_by_task(chat_id, task_id)
+        if not pending:
+            await query.answer("Assignment already handled.", show_alert=True)
+            return
+        if update.effective_user.id != pending["owner_id"]:
+            await query.answer("🛡️ Only the owner can assign this.", show_alert=True)
+            return
+
+        assignee = f"@{username}"
+        set_task_assignee(task_id, chat_id, assignee)
+        clear_pending_assignment(chat_id, task_id)
+
+        task = get_task(task_id, chat_id)
+        if not task:
+            await query.answer("❌ Task not found.", show_alert=True)
+            return
+
+        await query.answer(f"Assigned to {assignee}")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"✅ Assigned to {assignee}.",
+            message_thread_id=pending["thread_id"],
+        )
+        await send_assignee_prompt_to_chat(
+            context.bot,
+            chat_id,
+            pending["thread_id"],
+            task,
+        )
         return
 
 

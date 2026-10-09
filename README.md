@@ -50,9 +50,16 @@ Use a Google Apps Script to forward Fiverr emails to the bot.
 - `/task done <id>`
 - `/task submit <id>`
 - `/task status`
+- `/task sendissues`
+- `/task sendresolve <key> delivered <message_id>`
+- `/task sendresolve <key> notdelivered`
+- `/feedback <feedback_id>`
 - `/approve`
 
 ## Notes
 - Deadlines are interpreted in the timezone set by `BOT_TIMEZONE` (default: `America/Los_Angeles`).
 - Reminders are sent 24 hours and 1 hour before the deadline.
+- Scheduled reports and game invites are deduped. Failed sends can retry; uncertain sends require admin reconciliation with `/task sendresolve`.
+- Feedback is stored before display. If a long feedback display only partially sends, an authorized task owner/admin can redisplay it in the order topic with `/feedback <feedback_id>`.
+- Weekly/monthly completion reports count tracked completion timestamps only. Periods wholly before tracking began are skipped, and partial periods call out unknown earlier coverage.
 - Tasks are stored in `tasks.db` (SQLite) for persistence.

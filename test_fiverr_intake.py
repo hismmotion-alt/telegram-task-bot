@@ -2,9 +2,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+from telegram.error import BadRequest
 
 os.environ.setdefault("BOT_TOKEN", "test-token")
 
@@ -14,6 +15,8 @@ import main
 class FakeJobQueue:
     def __init__(self):
         self._jobs = []
+        self.daily_jobs = []
+        self.repeating_jobs = []
 
     def run_once(self, callback, when, data, name):
         job = SimpleNamespace(
@@ -26,16 +29,27 @@ class FakeJobQueue:
         job.schedule_removal = lambda: setattr(job, "removed", True)
         self._jobs.append(job)
 
+    def run_daily(self, callback, time, name):
+        job = SimpleNamespace(callback=callback, time=time, name=name)
+        self.daily_jobs.append(job)
+        self._jobs.append(job)
+
+    def run_repeating(self, callback, interval, first, name):
+        job = SimpleNamespace(callback=callback, interval=interval, first=first, name=name)
+        self.repeating_jobs.append(job)
+        self._jobs.append(job)
+
     def jobs(self):
         return self._jobs
 
 
 class FakeBot:
-    def __init__(self, fail_topic=False):
+    def __init__(self, fail_topic=False, send_exceptions=None):
         self.created_topics = []
         self.messages = []
         self.next_message_id = 100
         self.fail_topic = fail_topic
+        self.send_exceptions = list(send_exceptions or [])
 
     async def create_forum_topic(self, chat_id, name):
         if self.fail_topic:
@@ -45,6 +59,10 @@ class FakeBot:
         return SimpleNamespace(message_thread_id=thread_id)
 
     async def send_message(self, **kwargs):
+        if self.send_exceptions:
+            exc = self.send_exceptions.pop(0)
+            if exc:
+                raise exc
         self.next_message_id += 1
         self.messages.append(kwargs)
         return SimpleNamespace(message_id=self.next_message_id)
@@ -55,8 +73,8 @@ class FakeBot:
 
 
 class FakeApplication:
-    def __init__(self, fail_topic=False):
-        self.bot = FakeBot(fail_topic=fail_topic)
+    def __init__(self, fail_topic=False, send_exceptions=None):
+        self.bot = FakeBot(fail_topic=fail_topic, send_exceptions=send_exceptions)
         self.job_queue = FakeJobQueue()
 
 
@@ -67,6 +85,7 @@ class FakeTelegramMessage:
         self.text = text
         self.reply_to_message = reply_to_message
         self.replies = []
+        self.message_id = 123
 
     async def reply_text(self, text, **kwargs):
         self.replies.append((text, kwargs))
@@ -77,6 +96,7 @@ class FakeCallbackQuery:
     def __init__(self, data, chat_id, message_thread_id=None):
         self.data = data
         self.message = FakeTelegramMessage(chat_id, message_thread_id=message_thread_id)
+        self.message.message_id = 777
         self.answers = []
         self.markup_removed = False
         self.edits = []
@@ -730,6 +750,742 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()["status"]
         self.assertEqual(status, "assigned")
         self.assertEqual(query.answers[0][0], "⚠️ This button belongs to a different topic.")
+
+    async def test_completion_migration_preserves_legacy_done_and_tracks_new_done(self):
+        with main.get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks
+                (title, assignee, deadline_utc, creator_id, chat_id, message_thread_id, status, created_at_utc)
+                VALUES ('Legacy done', '@old', ?, 42, -100123, NULL, 'done', ?)
+                """,
+                (
+                    datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")).isoformat(),
+                    datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")).isoformat(),
+                ),
+            )
+        main.init_db()
+        with main.get_db() as conn:
+            legacy = conn.execute("SELECT completed_at_utc FROM tasks WHERE title = 'Legacy done'").fetchone()
+            tracking = conn.execute("SELECT value FROM settings WHERE key = 'tracking_start_utc'").fetchone()
+        self.assertIsNone(legacy["completed_at_utc"])
+        self.assertIsNotNone(tracking["value"])
+
+        task_id = main.save_task(
+            title="Manual tracked task",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        main.mark_task_done(task_id, -100123)
+        with main.get_db() as conn:
+            row = conn.execute("SELECT status, completed_at_utc FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(row["status"], "done")
+        self.assertIsNotNone(row["completed_at_utc"])
+
+    async def test_repeated_completion_does_not_move_completed_at_and_stale_start_cannot_reopen(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO3030303030",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=570,
+        )
+        main.mark_task_done(task_id, -100123)
+        with main.get_db() as conn:
+            first_completed_at = conn.execute("SELECT completed_at_utc FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+        main.mark_task_done(task_id, -100123)
+        self.assertFalse(main.set_task_status(task_id, -100123, "in_progress"))
+        with main.get_db() as conn:
+            row = conn.execute("SELECT status, completed_at_utc FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["completed_at_utc"], first_completed_at)
+
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:start", -100123, message_thread_id=570)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+        self.assertEqual(status, "done")
+        self.assertEqual(query.answers[0][0], "This task is already completed.")
+
+    async def test_legacy_ack_and_delivery_callbacks_cannot_reopen_done_task(self):
+        task_id = main.save_task(
+            title="Legacy callback done",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=571,
+        )
+        main.mark_task_done(task_id, -100123)
+
+        ack_query = FakeCallbackQuery(f"task_ack:{task_id}:yes", -100123, message_thread_id=571)
+        update = SimpleNamespace(
+            callback_query=ack_query,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+
+        delivery_query = FakeCallbackQuery(f"task_delivery:{task_id}:sent", -100123, message_thread_id=571)
+        update.callback_query = delivery_query
+        update.effective_user = SimpleNamespace(id=42, username="owner")
+        await main.on_callback_query(update, context)
+
+        with main.get_db() as conn:
+            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+        self.assertEqual(status, "done")
+        self.assertEqual(ack_query.answers[0][0], "This task is already completed.")
+        self.assertEqual(delivery_query.answers[0][0], "This task is already completed.")
+
+    async def test_completed_projects_report_counts_done_only_and_splits_fiverr(self):
+        main.set_setting("tracking_start_utc", "2026-10-01T00:00:00+00:00")
+        fiverr_task = main.save_task(
+            title="Fiverr order #FO3131313131",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=572,
+        )
+        manual_task = main.save_task(
+            title="Internal render cleanup",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        submitted_task = main.save_task(
+            title="Submitted but not done",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        with main.get_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO fiverr_orders
+                (order_id, chat_id, client_name, task_id, topic_thread_id, source, status, created_at_utc, updated_at_utc)
+                VALUES ('FO3131313131', -100123, 'buyer', ?, 572, 'test', 'created', ?, ?)
+                """,
+                (fiverr_task, datetime.now(tz=ZoneInfo("UTC")).isoformat(), datetime.now(tz=ZoneInfo("UTC")).isoformat()),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at_utc = ? WHERE id IN (?, ?)",
+                ("2026-10-07T18:00:00+00:00", fiverr_task, manual_task),
+            )
+            conn.execute("UPDATE tasks SET status = 'submitted' WHERE id = ?", (submitted_task,))
+
+        _, text = main.build_completed_projects_report(
+            "weekly",
+            datetime(2026, 10, 12, 16, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        self.assertIn("Tracked completions: 2", text)
+        self.assertIn("Fiverr order projects: 1", text)
+        self.assertIn("Other tracked tasks: 1", text)
+        self.assertIn("FO3131313131", text)
+        self.assertNotIn("Submitted but not done", text)
+
+    async def test_report_skips_wholly_pretracking_and_marks_partial_coverage(self):
+        main.set_setting("tracking_start_utc", "2026-10-09T16:32:00+00:00")
+        task_id = main.save_task(
+            title="Tracked after start",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 10, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        with main.get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at_utc = ? WHERE id = ?",
+                ("2026-10-10T18:00:00+00:00", task_id),
+            )
+
+        _, weekly = main.build_completed_projects_report(
+            "weekly",
+            datetime(2026, 10, 12, 16, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        _, monthly = main.build_completed_projects_report(
+            "monthly",
+            datetime(2026, 10, 12, 16, 0, tzinfo=ZoneInfo("UTC")),
+        )
+
+        self.assertIsNone(monthly)
+        self.assertIn("Tracked completions: 1", weekly)
+        self.assertIn("earlier part of this period is unknown", weekly)
+        self.assertNotIn("Done projects", weekly)
+
+    async def test_report_after_tracking_start_with_no_completions_says_none_tracked(self):
+        main.set_setting("tracking_start_utc", "2026-10-01T00:00:00+00:00")
+
+        _, text = main.build_completed_projects_report(
+            "weekly",
+            datetime(2026, 10, 19, 16, 0, tzinfo=ZoneInfo("UTC")),
+        )
+
+        self.assertIn("Tracked completions: 0", text)
+        self.assertIn("none tracked in the covered window", text)
+        self.assertNotIn("none completed in this period", text)
+
+    async def test_weekly_report_dedupe_prevents_restart_duplicate(self):
+        main.set_setting("general_thread_id", "10")
+        task_id = main.save_task(
+            title="Weekly completed task",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        with main.get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at_utc = ? WHERE id = ?",
+                ("2026-10-07T18:00:00+00:00", task_id),
+            )
+        context = SimpleNamespace(bot=self.app.bot)
+        now = datetime(2026, 10, 12, 16, 0, tzinfo=ZoneInfo("UTC"))
+
+        await main.completed_projects_report_job(context, "weekly", now)
+        await main.completed_projects_report_job(context, "weekly", now)
+
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(self.app.bot.messages[0]["message_thread_id"], 10)
+
+    async def test_report_boundaries_handle_dst_and_year_change(self):
+        start, end, label = main.previous_week_bounds_utc(
+            datetime(2026, 11, 9, 17, 0, tzinfo=ZoneInfo("UTC"))
+        )
+        self.assertEqual(start.astimezone(main.TZ).strftime("%Y-%m-%d %H:%M %Z"), "2026-11-02 00:00 PST")
+        self.assertEqual(end.astimezone(main.TZ).strftime("%Y-%m-%d %H:%M %Z"), "2026-11-09 00:00 PST")
+        self.assertIn("Nov", label)
+
+        start, end, label = main.previous_month_bounds_utc(
+            datetime(2027, 1, 1, 18, 0, tzinfo=ZoneInfo("UTC"))
+        )
+        self.assertEqual(start.astimezone(main.TZ).strftime("%Y-%m-%d %H:%M"), "2026-12-01 00:00")
+        self.assertEqual(end.astimezone(main.TZ).strftime("%Y-%m-%d %H:%M"), "2027-01-01 00:00")
+        self.assertEqual(label, "December 2026")
+
+    async def test_startup_schedules_use_la_timezone_and_defaults(self):
+        async def noop_start_webserver(app):
+            return None
+
+        old_start_webserver = main.start_webserver
+        main.start_webserver = noop_start_webserver
+        try:
+            await main.on_startup(self.app)
+        finally:
+            main.start_webserver = old_start_webserver
+        daily = {job.name: job for job in self.app.job_queue.daily_jobs}
+        self.assertEqual(daily["daily_update_10pm"].time.tzinfo, main.TZ)
+        self.assertEqual(daily["daily_update_10pm"].time.hour, 22)
+        self.assertEqual(daily["weekly_completed_projects"].time.hour, 9)
+        self.assertEqual(daily["monthly_completed_projects"].time.hour, 9)
+        self.assertEqual(daily["game_invites"].time.hour, 15)
+
+    async def test_game_invite_skips_without_configured_games_topic(self):
+        context = SimpleNamespace(bot=self.app.bot)
+        await main.game_invite_job(context)
+        self.assertEqual(self.app.bot.messages, [])
+
+    async def test_game_callback_is_topic_scoped_and_purges_participants_on_close(self):
+        session = main.create_game_session(
+            -100123,
+            600,
+            datetime(2026, 10, 9, 22, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        main.update_game_session_message(session["id"], 777)
+
+        wrong_topic = FakeCallbackQuery(f"game:answer:{session['id']}:{session['answer']}", -100123, message_thread_id=601)
+        update = SimpleNamespace(
+            callback_query=wrong_topic,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+        await main.on_callback_query(update, context)
+        self.assertEqual(wrong_topic.answers[0][0], "This game belongs in the Games topic.")
+
+        right_topic = FakeCallbackQuery(f"game:answer:{session['id']}:{session['answer']}", -100123, message_thread_id=600)
+        update.callback_query = right_topic
+        await main.on_callback_query(update, context)
+        self.assertEqual(right_topic.answers[0][0], "Correct! 🎉")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM game_answers").fetchone()[0], 1)
+
+        summary = main.close_game_session(session["id"])
+        self.assertEqual(summary, "1/1 correct")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM game_answers").fetchone()[0], 0)
+            stored = conn.execute("SELECT result_summary FROM game_sessions WHERE id = ?", (session["id"],)).fetchone()
+        self.assertEqual(stored["result_summary"], "1/1 correct")
+
+    async def test_games_topic_controls_do_not_create_live_topic(self):
+        message = FakeTelegramMessage(-100123, message_thread_id=602, text="/games settopic")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.cmd_games(update, context)
+
+        self.assertEqual(self.app.bot.created_topics, [])
+        self.assertIn("Games topic saved", message.replies[0][0])
+        self.assertEqual(main.get_setting("games_thread_id"), "602")
+
+    async def test_repeated_task_done_command_is_quiet_and_preserves_timestamp(self):
+        task_id = main.save_task(
+            title="Repeat done command",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        message = FakeTelegramMessage(-100123, text=f"/task done {task_id}")
+        update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+
+        await main.cmd_task(update, context)
+        with main.get_db() as conn:
+            first_completed_at = conn.execute("SELECT completed_at_utc FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+        await main.cmd_task(update, context)
+        with main.get_db() as conn:
+            second_completed_at = conn.execute("SELECT completed_at_utc FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+        self.assertEqual(first_completed_at, second_completed_at)
+        self.assertEqual(message.replies[0][0], "✅ Task completed.\nGreat work 👏")
+        self.assertEqual(message.replies[1][0], "✅ This task is already completed.")
+
+    async def test_scheduled_send_rejection_can_retry_but_timeout_stays_uncertain(self):
+        reject_app = FakeApplication(send_exceptions=[BadRequest("chat not found")])
+        sent = await main.send_scheduled_message(reject_app.bot, "report:reject", -100123, "hello")
+        self.assertFalse(sent)
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state, attempts FROM scheduled_sends WHERE key = 'report:reject'").fetchone()
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(row["attempts"], 1)
+
+        sent = await main.send_scheduled_message(self.app.bot, "report:reject", -100123, "hello again")
+        self.assertTrue(sent)
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state, attempts, message_id FROM scheduled_sends WHERE key = 'report:reject'").fetchone()
+        self.assertEqual(row["state"], "sent")
+        self.assertEqual(row["attempts"], 2)
+        self.assertIsNotNone(row["message_id"])
+
+        timeout_app = FakeApplication(send_exceptions=[TimeoutError("unknown delivery")])
+        sent = await main.send_scheduled_message(timeout_app.bot, "report:timeout", -100123, "maybe")
+        self.assertFalse(sent)
+        sent = await main.send_scheduled_message(self.app.bot, "report:timeout", -100123, "do not retry")
+        self.assertFalse(sent)
+        self.assertEqual(len(self.app.bot.messages), 1)
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state, attempts FROM scheduled_sends WHERE key = 'report:timeout'").fetchone()
+        self.assertEqual(row["state"], "uncertain")
+        self.assertEqual(row["attempts"], 1)
+
+    async def test_scheduled_send_pending_blocks_concurrent_attempt(self):
+        self.assertTrue(main.begin_scheduled_send("report:pending"))
+        self.assertFalse(main.begin_scheduled_send("report:pending"))
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state FROM scheduled_sends WHERE key = 'report:pending'").fetchone()
+        self.assertEqual(row["state"], "pending")
+
+    async def test_stale_pending_scheduled_send_becomes_uncertain_and_needs_resolution(self):
+        old_now = datetime(2026, 10, 9, 10, 0, tzinfo=ZoneInfo("UTC"))
+        self.assertTrue(main.begin_scheduled_send("report:stale", chat_id=-100123, thread_id=12, now=old_now))
+
+        sent = await main.send_scheduled_message(
+            self.app.bot,
+            "report:stale",
+            -100123,
+            "do not send while uncertain",
+            thread_id=12,
+            now=old_now + timedelta(minutes=20),
+        )
+
+        self.assertFalse(sent)
+        self.assertEqual(self.app.bot.messages, [])
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state, error, attempts FROM scheduled_sends WHERE key = 'report:stale'").fetchone()
+        self.assertEqual(row["state"], "uncertain")
+        self.assertEqual(row["error"], "stale_pending_after_restart")
+        self.assertEqual(row["attempts"], 1)
+
+        self.assertFalse(main.resolve_scheduled_send("report:stale", -100999, "notdelivered"))
+        self.assertTrue(main.resolve_scheduled_send("report:stale", -100123, "notdelivered"))
+        sent = await main.send_scheduled_message(
+            self.app.bot,
+            "report:stale",
+            -100123,
+            "safe retry after admin says missing",
+            thread_id=12,
+        )
+
+        self.assertTrue(sent)
+        with main.get_db() as conn:
+            row = conn.execute("SELECT state, attempts FROM scheduled_sends WHERE key = 'report:stale'").fetchone()
+        self.assertEqual(row["state"], "sent")
+        self.assertEqual(row["attempts"], 2)
+
+    async def test_admin_can_mark_uncertain_scheduled_send_delivered_with_message_id(self):
+        timeout_app = FakeApplication(send_exceptions=[TimeoutError("unknown delivery")])
+        sent = await main.send_scheduled_message(timeout_app.bot, "report:delivered", -100123, "maybe delivered")
+        self.assertFalse(sent)
+
+        self.assertTrue(main.resolve_scheduled_send("report:delivered", -100123, "delivered", 7777))
+
+        with main.get_db() as conn:
+            row = conn.execute(
+                "SELECT state, message_id, error FROM scheduled_sends WHERE key = 'report:delivered'"
+            ).fetchone()
+        self.assertEqual(row["state"], "sent")
+        self.assertEqual(row["message_id"], 7777)
+        self.assertIsNone(row["error"])
+
+    async def test_due_report_catchup_after_startup_dedupes(self):
+        main.set_setting("tracking_start_utc", "2026-09-01T00:00:00+00:00")
+        main.set_setting("general_thread_id", "11")
+        task_id = main.save_task(
+            title="Catchup completed task",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 1, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=None,
+        )
+        with main.get_db() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at_utc = ? WHERE id = ?",
+                ("2026-10-07T18:00:00+00:00", task_id),
+            )
+        context = SimpleNamespace(bot=self.app.bot)
+        now = datetime(2026, 10, 12, 17, 0, tzinfo=ZoneInfo("UTC"))
+
+        await main.catch_up_due_reports(context, now)
+        await main.catch_up_due_reports(context, now)
+
+        self.assertEqual(len(self.app.bot.messages), 2)
+        texts = [message["text"] for message in self.app.bot.messages]
+        self.assertEqual(sum("Weekly completed projects" in text for text in texts), 1)
+        self.assertEqual(sum("Monthly completed projects" in text for text in texts), 1)
+
+    async def test_game_rejects_forged_choice_without_persisting(self):
+        session = main.create_game_session(
+            -100123,
+            603,
+            datetime(2026, 10, 9, 22, 0, tzinfo=ZoneInfo("UTC")),
+        )
+        main.update_game_session_message(session["id"], 777)
+        query = FakeCallbackQuery(f"game:answer:{session['id']}:Forged", -100123, message_thread_id=603)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+
+        await main.on_callback_query(update, context)
+
+        self.assertEqual(query.answers[0][0], "That answer is not valid for this game.")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM game_answers").fetchone()[0], 0)
+
+    async def test_feedback_button_prompts_and_reply_saves_escaped_topic_message(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO4141414141",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=604,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:feedback", -100123, message_thread_id=604)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+
+        await main.on_callback_query(update, context)
+
+        prompt = query.message.replies[0]
+        self.assertIn("Send the feedback", prompt[0])
+        prompt_message = SimpleNamespace(message_id=prompt[1]["reply_markup"].inline_keyboard[0][0].callback_data.split(":")[1])
+        with main.get_db() as conn:
+            pending = conn.execute("SELECT * FROM pending_feedback").fetchone()
+        reply_to = SimpleNamespace(message_id=pending["prompt_message_id"])
+        message = FakeTelegramMessage(
+            -100123,
+            message_thread_id=604,
+            text="<b>Needs punchier timing</b>\nSecond line",
+            reply_to_message=reply_to,
+        )
+        reply_update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+
+        await main.on_reply_message(reply_update, context)
+
+        display = self.app.bot.messages[-1]
+        self.assertEqual(display["message_thread_id"], 604)
+        self.assertEqual(display["parse_mode"], main.ParseMode.HTML)
+        self.assertIn("&lt;b&gt;Needs punchier timing&lt;/b&gt;", display["text"])
+        with main.get_db() as conn:
+            saved = conn.execute("SELECT * FROM feedback_entries").fetchone()
+            pending = conn.execute("SELECT status FROM pending_feedback").fetchone()
+        self.assertEqual(saved["feedback_text"], "<b>Needs punchier timing</b>\nSecond line")
+        self.assertEqual(pending["status"], "submitted")
+
+    async def test_feedback_wrong_user_topic_cancel_and_expiry_are_ignored(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO4242424242",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=605,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:feedback", -100123, message_thread_id=605)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+        with main.get_db() as conn:
+            pending = conn.execute("SELECT * FROM pending_feedback").fetchone()
+
+        wrong_user_msg = FakeTelegramMessage(
+            -100123,
+            message_thread_id=605,
+            text="wrong user",
+            reply_to_message=SimpleNamespace(message_id=pending["prompt_message_id"]),
+        )
+        wrong_user_update = SimpleNamespace(
+            message=wrong_user_msg,
+            effective_message=wrong_user_msg,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        await main.on_reply_message(wrong_user_update, context)
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback_entries").fetchone()[0], 0)
+
+        wrong_topic_msg = FakeTelegramMessage(
+            -100123,
+            message_thread_id=606,
+            text="wrong topic",
+            reply_to_message=SimpleNamespace(message_id=pending["prompt_message_id"]),
+        )
+        wrong_topic_update = SimpleNamespace(
+            message=wrong_topic_msg,
+            effective_message=wrong_topic_msg,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        await main.on_reply_message(wrong_topic_update, context)
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback_entries").fetchone()[0], 0)
+
+        cancel_query = FakeCallbackQuery(f"feedback_cancel:{pending['request_id']}", -100123, message_thread_id=605)
+        cancel_update = SimpleNamespace(
+            callback_query=cancel_query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        await main.on_callback_query(cancel_update, context)
+        self.assertEqual(cancel_query.answers[0][0], "Cancelled")
+
+        late_msg = FakeTelegramMessage(
+            -100123,
+            message_thread_id=605,
+            text="late",
+            reply_to_message=SimpleNamespace(message_id=pending["prompt_message_id"]),
+        )
+        late_update = SimpleNamespace(
+            message=late_msg,
+            effective_message=late_msg,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        await main.on_reply_message(late_update, context)
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback_entries").fetchone()[0], 0)
+
+    async def test_feedback_expired_prompt_does_not_save(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO4343434343",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=607,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:feedback", -100123, message_thread_id=607)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+        with main.get_db() as conn:
+            pending = conn.execute("SELECT * FROM pending_feedback").fetchone()
+            conn.execute(
+                "UPDATE pending_feedback SET expires_at_utc = ? WHERE request_id = ?",
+                ("2026-01-01T00:00:00+00:00", pending["request_id"]),
+            )
+
+        message = FakeTelegramMessage(
+            -100123,
+            message_thread_id=607,
+            text="expired feedback",
+            reply_to_message=SimpleNamespace(message_id=pending["prompt_message_id"]),
+        )
+        reply_update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+
+        await main.on_reply_message(reply_update, context)
+
+        self.assertIn("expired", message.replies[0][0])
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM feedback_entries").fetchone()[0], 0)
+            status = conn.execute("SELECT status FROM pending_feedback WHERE request_id = ?", (pending["request_id"],)).fetchone()[0]
+        self.assertEqual(status, "expired")
+
+    async def test_feedback_partial_display_failure_saves_entry_and_explicit_redisplay(self):
+        feedback_app = FakeApplication(send_exceptions=[None, TimeoutError("second chunk unknown")])
+        task_id = main.save_task(
+            title="Fiverr order #FO4444444444",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=608,
+        )
+        query = FakeCallbackQuery(f"order_ctl:{task_id}:feedback", -100123, message_thread_id=608)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=feedback_app.bot, application=self.app)
+        await main.on_callback_query(update, context)
+        with main.get_db() as conn:
+            pending = conn.execute("SELECT * FROM pending_feedback").fetchone()
+
+        feedback_text = "A" * 2700 + "<b>tail</b>"
+        message = FakeTelegramMessage(
+            -100123,
+            message_thread_id=608,
+            text=feedback_text,
+            reply_to_message=SimpleNamespace(message_id=pending["prompt_message_id"]),
+        )
+        reply_update = SimpleNamespace(
+            message=message,
+            effective_message=message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+
+        await main.on_reply_message(reply_update, context)
+
+        with main.get_db() as conn:
+            entry = conn.execute("SELECT * FROM feedback_entries").fetchone()
+            chunk_count = conn.execute("SELECT COUNT(*) FROM feedback_display_chunks").fetchone()[0]
+            pending_status = conn.execute("SELECT status FROM pending_feedback").fetchone()[0]
+        self.assertEqual(entry["feedback_text"], feedback_text)
+        self.assertEqual(entry["display_state"], "display_uncertain")
+        self.assertEqual(chunk_count, 1)
+        self.assertEqual(pending_status, "display_uncertain")
+        self.assertEqual(len(feedback_app.bot.messages), 1)
+
+        redisplay_message = FakeTelegramMessage(-100123, message_thread_id=608, text=f"/feedback {entry['id']}")
+        redisplay_update = SimpleNamespace(
+            message=redisplay_message,
+            effective_message=redisplay_message,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        redisplay_context = SimpleNamespace(bot=self.app.bot)
+
+        await main.cmd_feedback(redisplay_update, redisplay_context)
+
+        self.assertEqual(len(self.app.bot.messages), 2)
+        self.assertEqual(self.app.bot.messages[0]["message_thread_id"], 608)
+        self.assertIn("Feedback #", self.app.bot.messages[0]["text"])
+        self.assertIn("&lt;b&gt;tail&lt;/b&gt;", self.app.bot.messages[1]["text"])
+        with main.get_db() as conn:
+            entry = conn.execute("SELECT display_state, display_message_id FROM feedback_entries").fetchone()
+        self.assertEqual(entry["display_state"], "sent")
+        self.assertIsNotNone(entry["display_message_id"])
+
+    async def test_feedback_redisplay_is_authorized_and_topic_scoped(self):
+        task_id = main.save_task(
+            title="Fiverr order #FO4545454545",
+            assignee="@designer",
+            deadline_utc=datetime(2026, 10, 9, tzinfo=ZoneInfo("UTC")),
+            creator_id=42,
+            chat_id=-100123,
+            thread_id=609,
+        )
+        feedback_id = main.save_feedback_entry(
+            request_id="request-45",
+            chat_id=-100123,
+            thread_id=609,
+            task_id=task_id,
+            user_id=42,
+            username="owner",
+            feedback_text="Approved text",
+        )
+
+        wrong_topic = FakeTelegramMessage(-100123, message_thread_id=610, text=f"/feedback {feedback_id}")
+        update = SimpleNamespace(
+            message=wrong_topic,
+            effective_message=wrong_topic,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=42, username="owner"),
+        )
+        context = SimpleNamespace(bot=self.app.bot)
+        await main.cmd_feedback(update, context)
+        self.assertIn("different topic", wrong_topic.replies[0][0])
+        self.assertEqual(self.app.bot.messages, [])
+
+        wrong_user = FakeTelegramMessage(-100123, message_thread_id=609, text=f"/feedback {feedback_id}")
+        update = SimpleNamespace(
+            message=wrong_user,
+            effective_message=wrong_user,
+            effective_chat=SimpleNamespace(id=-100123),
+            effective_user=SimpleNamespace(id=99, username="designer"),
+        )
+        await main.cmd_feedback(update, context)
+        self.assertIn("Only the task creator or an admin", wrong_user.replies[0][0])
+        self.assertEqual(self.app.bot.messages, [])
 
 
 class AppsScriptDraftTests(unittest.TestCase):

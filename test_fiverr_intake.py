@@ -161,7 +161,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         inbound = email(
             "Great news: You've received a milestones order from buyer7",
             "You've just received a milestones order from buyer7.\n"
-            "1st milestone: Milestone 1 $400. Milestone 2 $200.\n"
+            "1st milestone: Milestone 1 $120. Milestone 2 $80.\n"
             "If you haven't received the order requirements yet, send a reminder.",
             html_body='<a href="https://www.fiverr.com/orders/FO1234AB56789?email_name=milestones_gig_order_started_to_seller">View Order</a>',
         )
@@ -1689,10 +1689,10 @@ class ExplicitDeadlineTests(unittest.TestCase):
 
     def test_missing_incomplete_invalid_and_conflicting_dates_are_not_guessed(self):
         for body in (
-            "Milestone 1 $400. Milestone 2 $200.",
+            "Milestone 1 $120. Milestone 2 $80.",
             "Delivery in 7 days.",
             "Due Nov 20", "Deadline: 11/20", "Due Feb 30, 2026",
-            "Copyright 2026. Order FO7315FA05547.",
+            "Copyright 2026. Order FO12345678901.",
             "Due Nov 20, 2026. Second milestone due Nov 30, 2026.",
             "Due November 20, 2026 17:00 CET",
             "Due November 20, 2026 CET",

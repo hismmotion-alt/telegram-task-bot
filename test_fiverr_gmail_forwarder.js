@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, 'fiverr_gmail_forwarder.gs')
 function message(id, fields = {}) {
   const data = {
     from: 'Fiverr <noreply@e.fiverr.com>', date: new Date(),
-    subject: "Great news: You've received a milestones order from arkeo7",
+    subject: "Great news: You've received a milestones order from buyer7",
     body: 'A new milestones order.',
     html: '<a href="https://www.fiverr.com/users/example/orders/FO12345678">milestones_gig_order_started_to_seller</a>',
     ...fields,

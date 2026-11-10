@@ -42,6 +42,44 @@ python main.py
 Use a Google Apps Script to forward Fiverr emails to the bot.
 - Set `GMAIL_WEBHOOK_TOKEN` in `.env` / Render env.
 - Endpoint: `POST /gmail/inbound` with JSON `{ "subject": "...", "body": "..." }`
+- Update the existing Apps Script with `fiverr_gmail_forwarder.gs` separately from
+  the Render deployment. Preserve its existing webhook URL/token, trigger, and
+  script properties; do not copy the repository's placeholder token into production.
+- The forwarder scans the last two days and sends only order-related messages from
+  the two configured Fiverr notification addresses. Message IDs, not Gmail thread
+  labels, prevent duplicate delivery. Later requirements messages in labeled
+  threads are still checked. A saved scan cursor keeps slow failures from blocking
+  later messages. This is not a historical backfill.
+- HTTP 200 with body `ok` acknowledges a handled email (created, ignored, deferred,
+  or quarantined). Transport failures, other responses, and missing bot routing or
+  owner settings remain retryable.
+- Ordinary and milestones order templates are supported. A deadline must contain
+  an explicit full calendar date, such as `Due Nov 20, 2026` or
+  `Delivery date: 2026-11-20`. Incomplete, unsupported, or conflicting deadlines
+  are quarantined instead of guessed. A later requirements email can use a stored
+  pending deadline only when it contains no new deadline evidence.
+- A recognized milestone order with an order ID and genuinely missing deadline
+  creates one topic in `awaiting_due` state, without a task, reminders, or intro
+  messages. Replay and restart reuse that topic. A later explicit valid deadline
+  upgrades it to a task in the same topic; task creation and order linkage commit
+  atomically. Invalid or conflicting deadlines remain quarantined.
+  Verify existing Telegram/database records before recovering historical orders.
+  Do not replay an uncertain topic-creation attempt blindly.
+
+## Tests
+Run the offline suites after installing requirements (Node.js is also needed):
+
+```bash
+python -m unittest -q
+node test_fiverr_gmail_forwarder.js
+python -m compileall -q main.py test_fiverr_intake.py
+```
+
+The suites use temporary databases and fake Telegram/Gmail/webhook clients.
+They do not verify the deployed Apps Script trigger or make live API calls.
+Application log formatting redacts configured credentials and Telegram URLs;
+routine HTTP client INFO logging is disabled. Existing historical logs are not
+rewritten, and credentials are not rotated by this code change.
 
 ## Commands
 - `/task add "Title" @user YYYY-MM-DD HH:MM`

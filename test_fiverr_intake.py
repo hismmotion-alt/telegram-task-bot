@@ -1,7 +1,11 @@
 import os
+import sqlite3
+import io
+import logging
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -152,6 +156,164 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["order_id"], "FO1234567890")
         self.assertEqual(len(tasks), 1)
+
+    async def test_milestone_order_without_due_creates_topic_without_task_or_invented_deadline(self):
+        inbound = email(
+            "Great news: You've received a milestones order from buyer7",
+            "You've just received a milestones order from buyer7.\n"
+            "1st milestone: Milestone 1 $400. Milestone 2 $200.\n"
+            "If you haven't received the order requirements yet, send a reminder.",
+            html_body='<a href="https://www.fiverr.com/orders/FO1234AB56789?email_name=milestones_gig_order_started_to_seller">View Order</a>',
+        )
+        self.assertIsNone(main.extract_due_datetime(main.email_search_text(inbound), inbound.subject))
+        decision = main.classify_fiverr_email(inbound, "Gmail")
+        self.assertEqual((decision.action, decision.reason), ("create_topic_pending_due", "milestone_awaiting_due"))
+        self.assertIsNone(decision.order.due)
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        restarted = FakeApplication()
+        await main.process_inbound_email(restarted, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(restarted.bot.created_topics, [])
+        self.assertEqual(self.app.bot.messages, [])
+        self.assertEqual(self.app.job_queue.jobs(), [])
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
+            self.assertEqual(row["status"], "awaiting_due")
+            self.assertEqual(row["topic_thread_id"], self.app.bot.created_topics[0][2])
+            self.assertIsNone(row["task_id"])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM inbound_quarantine").fetchone()[0], 0)
+
+    async def test_milestone_order_with_explicit_due_creates_once(self):
+        inbound = email(
+            "Great news: You've received a milestones order from buyer7",
+            "You've just received a milestones order from buyer7.\n"
+            "Order #FO1234AB56789 is due Nov 20, 2026.",
+            html_body='<a href="https://fiverr.com/orders/FO1234AB56789?email_name=milestones_gig_order_started_to_seller">View Order</a>',
+        )
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(self.app.bot.created_topics[0][1], "buyer7 - FO1234AB56789")
+        task = main.get_task(1, -100123)
+        self.assertEqual(task.deadline_utc.astimezone(main.TZ), datetime(2026, 11, 19, tzinfo=main.TZ))
+
+    async def test_later_requirements_with_due_reuses_pending_milestone_topic(self):
+        initial = email(
+            "Great news: You've received a milestones order from buyer7",
+            "You've received a milestones order from buyer7. Order #FO1234AB56789.",
+        )
+        await main.process_inbound_email(self.app, initial, "Gmail")
+        followup = email(
+            "The requirements are in!",
+            "buyer7 has sent the requirements and your order FO1234AB56789 is now in progress.\n"
+            "Delivery date: November 20, 2026.",
+            message_id="requirements-later",
+        )
+        await main.process_inbound_email(self.app, followup, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+
+        with main.get_db() as conn:
+            row = conn.execute("SELECT * FROM fiverr_orders WHERE order_id = 'FO1234AB56789'").fetchone()
+            self.assertEqual(row["status"], "created")
+            task = main.get_task(row["task_id"], -100123)
+        self.assertEqual(task.thread_id, self.app.bot.created_topics[0][2])
+        await main.process_inbound_email(self.app, followup, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+    async def test_pending_topic_task_upgrade_is_atomic_after_link_failure(self):
+        initial = email("You've received a milestones order from buyer7", "Order #FO1234AB56789.")
+        await main.process_inbound_email(self.app, initial, "Gmail")
+        dated = email("The requirements are in!", "buyer7 has sent the requirements and your order FO1234AB56789 is now in progress. Due Nov 20, 2026.", message_id="dated-upgrade")
+        with main.get_db() as conn:
+            conn.execute("""CREATE TRIGGER fail_order_link BEFORE UPDATE OF task_id ON fiverr_orders
+                WHEN NEW.task_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'synthetic link failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            await main.process_inbound_email(self.app, dated, "Gmail")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT status FROM fiverr_orders").fetchone()[0], "awaiting_due")
+            conn.execute("DROP TRIGGER fail_order_link")
+        await main.process_inbound_email(self.app, dated, "Gmail")
+        await main.process_inbound_email(self.app, dated, "Gmail")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
+            self.assertEqual(row["status"], "created")
+            self.assertIsNotNone(row["task_id"])
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+
+    async def test_milestone_with_invalid_date_does_not_create_topic(self):
+        inbound = email("You've received a milestones order from buyer7", "Order #FO1234AB56789. Due tomorrow.")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(self.app.bot.created_topics, [])
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT reason FROM inbound_quarantine").fetchone()[0], "invalid_due_date")
+
+    async def test_pending_milestone_topic_failure_is_not_retried(self):
+        self.app.bot.fail_topic = True
+        inbound = email("You've received a milestones order from buyer7", "Order #FO1234AB56789.")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.app.bot.fail_topic = False
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(self.app.bot.created_topics, [])
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM fiverr_orders").fetchone()[0], "quarantined:uncertain_create_retry")
+
+    async def test_later_undated_requirements_preserves_pending_topic_without_task(self):
+        initial = email("You've received a milestones order from buyer7", "Order #FO1234AB56789.")
+        await main.process_inbound_email(self.app, initial, "Gmail")
+        followup = email("The requirements are in!", "buyer7 has sent the requirements and your order FO1234AB56789 is now in progress.", message_id="requirements-undated")
+        await main.process_inbound_email(self.app, followup, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT status FROM fiverr_orders").fetchone()[0], "awaiting_due")
+
+    async def test_requirements_conflict_or_invalid_date_never_reuses_pending_due(self):
+        waiting = email(
+            "Order waiting for requirements",
+            "Your order FO1234AB56789 with buyer7 due on Nov 20, 2026 is waiting for requirements.",
+        )
+        await main.process_inbound_email(self.app, waiting, "Gmail")
+        cases = (
+            ("Due Nov 21, 2026. Second milestone due Nov 30, 2026.", "conflicting_due_dates"),
+            ("Due Nov 21", "invalid_due_date"),
+            ("Due tomorrow", "invalid_due_date"),
+            ("Due Nov 20, 2026. Revised deadline Nov 21", "invalid_due_date"),
+            ("Due Nov 21, 2026 17:00 CET", "invalid_due_date"),
+        )
+        for index, (body, reason) in enumerate(cases):
+            inbound = email(
+                "The requirements are in!",
+                "buyer7 has sent the requirements and your order FO1234AB56789 is now in progress. " + body,
+                message_id=f"conflict-{index}",
+            )
+            await main.process_inbound_email(self.app, inbound, "Gmail")
+            with main.get_db() as conn:
+                self.assertEqual(conn.execute("SELECT reason FROM inbound_quarantine ORDER BY id DESC LIMIT 1").fetchone()[0], reason)
+        self.assertEqual(self.app.bot.created_topics, [])
+
+    async def test_webhook_missing_configuration_is_retryable(self):
+        class Request:
+            headers = {"X-Webhook-Token": "synthetic-token"}
+            query = {}
+
+            async def json(self):
+                return {"subject": "A Fiverr order", "messageId": "retryable"}
+
+        with patch.object(main, "GMAIL_WEBHOOK_TOKEN", "synthetic-token"):
+            for setting in ("general_chat_id", "owner_user_id"):
+                old = main.get_setting(setting)
+                main.set_setting(setting, "")
+                response = await main.handle_gmail_webhook(Request(), self.app)
+                self.assertEqual(response.status, 503)
+                main.set_setting(setting, old)
+        self.assertEqual(self.app.bot.created_topics, [])
+        self.assertEqual(self.app.bot.messages, [])
 
     async def test_fiverr_assignment_prompt_includes_recent_assignee_button(self):
         main.save_task(
@@ -941,6 +1103,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("none completed in this period", text)
 
     async def test_weekly_report_dedupe_prevents_restart_duplicate(self):
+        main.set_setting("tracking_start_utc", "2026-10-01T00:00:00+00:00")
         main.set_setting("general_thread_id", "10")
         task_id = main.save_task(
             title="Weekly completed task",
@@ -1005,7 +1168,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         session = main.create_game_session(
             -100123,
             600,
-            datetime(2026, 10, 9, 22, 0, tzinfo=ZoneInfo("UTC")),
+            datetime.now(tz=ZoneInfo("UTC")),
         )
         main.update_game_session_message(session["id"], 777)
 
@@ -1195,7 +1358,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         session = main.create_game_session(
             -100123,
             603,
-            datetime(2026, 10, 9, 22, 0, tzinfo=ZoneInfo("UTC")),
+            datetime.now(tz=ZoneInfo("UTC")),
         )
         main.update_game_session_message(session["id"], 777)
         query = FakeCallbackQuery(f"game:answer:{session['id']}:Forged", -100123, message_thread_id=603)
@@ -1491,20 +1654,112 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
 class AppsScriptDraftTests(unittest.TestCase):
     def test_failed_webhook_does_not_mark_or_label_processed(self):
         script = Path("fiverr_gmail_forwarder.gs").read_text(encoding="utf-8")
-        self.assertIn("let threadComplete = true;", script)
+        self.assertIn("let threadComplete =", script)
         self.assertIn("threadComplete = false;", script)
         self.assertIn("if (threadComplete)", script)
-        self.assertLess(script.index("if (res.getResponseCode() === 200)"), script.index("props.setProperty(processedKey"))
+        self.assertLess(script.index('if (res.getResponseCode() === 200 && res.getContentText().trim() === "ok")'), script.index("props.setProperty(processedKey"))
 
     def test_processed_ids_are_preserved_and_checked_before_fetch(self):
         script = Path("fiverr_gmail_forwarder.gs").read_text(encoding="utf-8")
         self.assertIn('const processedKey = "processed_" + messageId;', script)
         self.assertLess(script.index("props.getProperty(processedKey)"), script.index("UrlFetchApp.fetch"))
 
-    def test_query_quote_is_safe_for_apostrophe(self):
+    def test_query_includes_milestones_and_later_thread_messages(self):
         script = Path("fiverr_gmail_forwarder.gs").read_text(encoding="utf-8")
-        self.assertIn("`(\"Great news: You've received an order from\"", script)
-        self.assertNotIn("You\\\\\\'ve", script)
+        self.assertIn('"from:(noreply@e.fiverr.com OR noreply@fiverr.com) newer_than:2d"', script)
+        self.assertNotIn('"-label:"', script)
+        self.assertNotIn("Great news: You've received an order from", script)
+
+
+class ExplicitDeadlineTests(unittest.TestCase):
+    def test_complete_labeled_dates_and_times(self):
+        cases = [
+            ("Order is due Nov 20, 2026.", datetime(2026, 11, 20, tzinfo=main.TZ)),
+            ("Delivery date: 2026-11-20", datetime(2026, 11, 20, tzinfo=main.TZ)),
+            ("Deadline: 20 November 2026", datetime(2026, 11, 20, tzinfo=main.TZ)),
+            ("Due on Nov 20, 2026 at 10:30 AM PST", datetime(2026, 11, 20, 10, 30, tzinfo=main.TZ)),
+            ("Due November 20, 2026 at 5 PM", datetime(2026, 11, 20, 17, tzinfo=main.TZ)),
+            ("Due November 20, 2026, 17:00 UTC", datetime(2026, 11, 20, 17, tzinfo=ZoneInfo("UTC"))),
+            ("Due November 20, 2026 (17:00 UTC)", datetime(2026, 11, 20, 17, tzinfo=ZoneInfo("UTC"))),
+            ("Deadline: 2026-11-20T18:30:00Z", datetime(2026, 11, 20, 18, 30, tzinfo=ZoneInfo("UTC"))),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(main.extract_due_datetime(body, "Order from buyer7"), expected)
+
+    def test_missing_incomplete_invalid_and_conflicting_dates_are_not_guessed(self):
+        for body in (
+            "Milestone 1 $400. Milestone 2 $200.",
+            "Delivery in 7 days.",
+            "Due Nov 20", "Deadline: 11/20", "Due Feb 30, 2026",
+            "Copyright 2026. Order FO7315FA05547.",
+            "Due Nov 20, 2026. Second milestone due Nov 30, 2026.",
+            "Due November 20, 2026 17:00 CET",
+            "Due November 20, 2026 CET",
+            "Due November 20, 2026. 17:00 UTC",
+            "Due November 20, 2026 17:00 UTC+05:30",
+            "Due November 20, 2026 at 5",
+            "Due November 20, 2026. Revised deadline November 21",
+            "Due November 20, 2026 17:00 +2500",
+            "Due November 20, 2026 17:00 +0560",
+            "Due tomorrow",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(main.extract_due_datetime(body, "Great news: You've received an order from buyer7"))
+
+    def test_explicit_standard_time_uses_its_fixed_offset_in_summer(self):
+        due = main.extract_due_datetime("Due July 20, 2026 17:00 PST", "")
+        self.assertEqual(due.utcoffset(), timedelta(hours=-8))
+        due = main.extract_due_datetime("Due July 20, 2026 17:00 PDT", "")
+        self.assertEqual(due.utcoffset(), timedelta(hours=-7))
+
+    def test_duplicate_html_and_plain_date_is_not_a_conflict(self):
+        body = "Due Nov 20, 2026. <p>Due Nov 20, 2026.</p>"
+        self.assertEqual(main.extract_due_datetime(body, ""), datetime(2026, 11, 20, tzinfo=main.TZ))
+
+
+class CredentialLoggingTests(unittest.TestCase):
+    def test_request_urls_and_configured_secrets_are_redacted(self):
+        formatter = main.CredentialRedactingFormatter("%(levelname)s %(message)s")
+        with patch.dict(os.environ, {"BOT_TOKEN": "synthetic-bot-secret", "GMAIL_WEBHOOK_TOKEN": "synthetic-webhook-secret"}):
+            record = logging.LogRecord("httpx", logging.WARNING, "", 0,
+                "POST %s token=%s webhook=%s", (
+                    "https://api.telegram.org/bot123456789:syntheticoldtoken/getUpdates",
+                    "synthetic-bot-secret", "synthetic-webhook-secret"), None)
+            output = formatter.format(record)
+        self.assertIn("bot[REDACTED]/getUpdates", output)
+        for secret in ("syntheticoldtoken", "synthetic-bot-secret", "synthetic-webhook-secret"):
+            self.assertNotIn(secret, output)
+
+    def test_exception_tracebacks_are_redacted(self):
+        formatter = main.CredentialRedactingFormatter("%(message)s")
+        try:
+            raise RuntimeError("Failed https://api.telegram.org/file/bot123456789:syntheticoldtoken/file")
+        except RuntimeError:
+            import sys
+            record = logging.LogRecord("bot", logging.ERROR, "", 0, "Request failed", (), sys.exc_info())
+        output = formatter.format(record)
+        self.assertIn("RuntimeError", output)
+        self.assertNotIn("syntheticoldtoken", output)
+
+    def test_setup_redacts_existing_root_handlers(self):
+        root = logging.getLogger()
+        old_handlers, old_level = root.handlers[:], root.level
+        httpx, httpcore = logging.getLogger("httpx"), logging.getLogger("httpcore")
+        old_levels = httpx.level, httpcore.level
+        stream = io.StringIO()
+        try:
+            root.handlers = [logging.StreamHandler(stream)]
+            main.setup_logging()
+            self.assertEqual(httpx.level, logging.WARNING)
+            self.assertEqual(httpcore.level, logging.WARNING)
+            httpx.warning("https://api.telegram.org/bot123456789:syntheticoldtoken/getUpdates")
+            self.assertNotIn("syntheticoldtoken", stream.getvalue())
+            self.assertIn("[REDACTED]", stream.getvalue())
+        finally:
+            root.handlers, root.level = old_handlers, old_level
+            httpx.setLevel(old_levels[0])
+            httpcore.setLevel(old_levels[1])
 
 
 if __name__ == "__main__":

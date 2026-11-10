@@ -66,7 +66,7 @@ class InboundEmail:
 class FiverrOrder:
     order_id: str
     client_name: str
-    due: datetime
+    due: Optional[datetime]
     source: str
     message_id: str
     received_at: str = ""
@@ -79,11 +79,34 @@ class FiverrDecision:
     order: Optional[FiverrOrder] = None
 
 
+class CredentialRedactingFormatter(logging.Formatter):
+    """Redact credentials after formatting, including exception tracebacks."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        rendered = re.sub(
+            r"(?i)(api\.telegram\.org/(?:file/)?bot)[^/\s\"'?]+",
+            r"\1[REDACTED]",
+            rendered,
+        )
+        for key in ("BOT_TOKEN", "GMAIL_WEBHOOK_TOKEN", "MAILGUN_SIGNING_KEY"):
+            secret = os.getenv(key)
+            if secret:
+                rendered = rendered.replace(secret, "[REDACTED]")
+        return rendered
+
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    formatter = CredentialRedactingFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
+    # Routine Telegram polling logs include the bot token in their URL.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 @contextmanager
@@ -1174,20 +1197,48 @@ def reserve_fiverr_order(order: FiverrOrder, chat_id: int) -> tuple[Optional[sql
         return row, inserted
 
 
-def mark_fiverr_order_created(
-    order_id: str,
-    task_id: int,
-    topic_thread_id: Optional[int],
-) -> None:
+def save_fiverr_task(
+    order: FiverrOrder,
+    deadline_utc: datetime,
+    creator_id: int,
+    chat_id: int,
+    topic_thread_id: int,
+) -> Optional[int]:
+    """Insert the task and link its order atomically, including pending upgrades."""
     now = datetime.now(tz=ZoneInfo("UTC")).isoformat()
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM fiverr_orders WHERE order_id = ?", (order.order_id,)).fetchone()
+        if not row or row["task_id"] or row["chat_id"] != chat_id:
+            return None
+        if row["status"] not in {"processing", "awaiting_due"}:
+            return None
+        if row["topic_thread_id"] and row["topic_thread_id"] != topic_thread_id:
+            return None
+        cursor = conn.execute(
+            """
+            INSERT INTO tasks (title, assignee, deadline_utc, creator_id, chat_id, message_thread_id, status, created_at_utc)
+            VALUES (?, '@unassigned', ?, ?, ?, ?, 'assigned', ?)
+            """,
+            (f"Fiverr order #{order.order_id}", deadline_utc.isoformat(), creator_id, chat_id, topic_thread_id, now),
+        )
+        task_id = int(cursor.lastrowid)
         conn.execute(
             """
             UPDATE fiverr_orders
             SET task_id = ?, topic_thread_id = ?, status = 'created', updated_at_utc = ?
             WHERE order_id = ?
             """,
-            (task_id, topic_thread_id, now, order_id),
+            (task_id, topic_thread_id, now, order.order_id),
+        )
+        return task_id
+
+
+def mark_fiverr_order_awaiting_due(order_id: str, topic_thread_id: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE fiverr_orders SET topic_thread_id = ?, status = 'awaiting_due', updated_at_utc = ? WHERE order_id = ?",
+            (topic_thread_id, datetime.now(tz=ZoneInfo("UTC")).isoformat(), order_id),
         )
 
 
@@ -1955,6 +2006,7 @@ def extract_client_name(subject: str, body: str) -> Optional[str]:
     combined = f"{subject}\n{body}"
     patterns = [
         r"(?i)order from[:\-]\s*(.+)",
+        r"(?i)received a milestones? order from\s+(.+)",
         r"(?i)you received an order from\s+(.+)",
         r"(?i)you just received an order from\s+(.+)",
         r"(?i)you'?ve received an order from\s+(.+)",
@@ -1981,58 +2033,85 @@ def extract_client_name(subject: str, body: str) -> Optional[str]:
     return None
 
 
-def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
-    combined = f"{subject}\n{body}"
-    due_patterns = [
-        r"(?i)\bdue on\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
-        r"(?i)\bdue\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
-        r"(?i)\bis due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})",
-    ]
-    for pattern in due_patterns:
-        m = re.search(pattern, combined)
-        if m:
-            try:
-                dt = date_parser.parse(m.group(1))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=TZ)
-                return dt
-            except (OverflowError, ValueError, TypeError):
-                pass
-    # Strong pattern: "is due Feb 11, 2026"
-    m = re.search(r"(?i)is due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})", combined)
-    if m:
-        try:
-            dt = date_parser.parse(m.group(1))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            return dt
-        except (OverflowError, ValueError, TypeError):
-            pass
-    # Fallback: "due Feb 11, 2026"
-    m = re.search(r"(?i)due\s+([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})", combined)
-    if m:
-        try:
-            dt = date_parser.parse(m.group(1))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=TZ)
-            return dt
-        except (OverflowError, ValueError, TypeError):
-            pass
-    candidate_lines = []
-    for line in body.splitlines():
-        if re.search(r"(?i)due|deliver|delivery|deadline", line):
-            candidate_lines.append(line)
-    candidate_lines.extend([subject])
-    now_local = datetime.now(tz=TZ).replace(hour=18, minute=0, second=0, microsecond=0)
-    for line in candidate_lines:
-        try:
-            dt = date_parser.parse(line, fuzzy=True, default=now_local)
-        except (OverflowError, ValueError, TypeError):
+def parse_due_datetime(body: str, subject: str) -> tuple[Optional[datetime], str]:
+    """Parse every labeled deadline; never infer a date from unrelated numbers."""
+    combined = normalize_text(html_to_text(f"{subject}\n{body}"))
+    month = (
+        r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    )
+    calendar_date = (
+        rf"(?:{month}\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}|"
+        rf"\d{{1,2}}(?:st|nd|rd|th)?\s+{month},?\s+\d{{4}}|\d{{4}}-\d{{2}}-\d{{2}})"
+        r"(?=\s|$|[.,;!?()]|T\d)"
+    )
+    label = r"\b(?:due(?:\s+date)?|deadline|delivery(?:\s+date)?|deliver\s+by)\b"
+    separator = r"\s*(?:(?:on|by|is)\s*)?[:\-]?\s*"
+    clock = (
+        r"(?:(?:\s*[,()]\s*|\s+)(?:at\s+)?|T)"
+        r"(?P<clock>\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?|\d{1,2}\s*[AP]M)"
+        r"(?:\s*(?P<zone>[A-Za-z]{1,5}(?:[+-]\d{2}:?\d{2})?|[+-]\d{2}:?\d{2}))?"
+    )
+    timezones = {"UTC": 0, "GMT": 0, "Z": 0, "PST": -28800, "PDT": -25200, "EST": -18000, "EDT": -14400}
+    candidates = set()
+    invalid = False
+    for label_match in re.finditer(label + separator, combined, re.I):
+        value = combined[label_match.end():]
+        date_match = re.match(calendar_date, value, re.I)
+        if not date_match:
+            # "delivery" in ordinary prose isn't a deadline label. Stronger
+            # labels and relative/incomplete delivery dates are new evidence.
+            if label_match.group().lower().startswith("delivery") and not re.match(
+                rf"(?i)(?:{month}\b|\d|in\b|today\b|tomorrow\b|next\b)", value
+            ):
+                continue
+            invalid = True
             continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt
-    return None
+        candidate = date_match.group()
+        suffix = value[date_match.end():]
+        time_match = re.match(clock, suffix, re.I)
+        if time_match:
+            zone = (time_match.group("zone") or "").upper()
+            suffix = suffix[time_match.end():]
+            if zone and zone not in timezones:
+                offset = re.fullmatch(r"[+-](\d{2}):?(\d{2})", zone)
+                if not offset or int(offset[1]) >= 24 or int(offset[2]) >= 60:
+                    invalid = True
+                    continue
+            candidate += " " + time_match.group("clock")
+            if zone:
+                candidate += " " + zone
+        # Do not accept only the date prefix of an unsupported clock/zone.
+        # Punctuation is allowed before a clock, but never hides its evidence.
+        tail = re.sub(r"^[\s,().]+", "", suffix)
+        if re.match(r"(?i)(?:at\b|T?\d|[+-]\d|UTC\b|GMT\b|PST\b|PDT\b|EST\b|EDT\b)", tail):
+            invalid = True
+            continue
+        if not time_match and re.match(r"[A-Z]{2,5}\b", tail):
+            invalid = True
+            continue
+        if time_match and suffix and not re.match(r"^[\s).,;!?]", suffix):
+            invalid = True
+            continue
+        try:
+            due = date_parser.parse(candidate, fuzzy=False, default=datetime(2000, 1, 1), tzinfos=timezones)
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=TZ)
+            due.utcoffset()  # Force timezone validation before comparing dates.
+            candidates.add(due)
+        except (OverflowError, ValueError, TypeError):
+            invalid = True
+    if invalid:
+        return None, "invalid_due_date"
+    if len(candidates) > 1:
+        return None, "conflicting_due_dates"
+    if candidates:
+        return candidates.pop(), "explicit_due_date"
+    return None, "missing_due_date"
+
+
+def extract_due_datetime(body: str, subject: str) -> Optional[datetime]:
+    return parse_due_datetime(body, subject)[0]
 
 
 def extract_order_id(text: str) -> Optional[str]:
@@ -2061,6 +2140,7 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
     seller_start_email_names = {
         "gig_order_started_seller",
         "gig_order_with_requirements_started_to_seller",
+        "milestones_gig_order_started_to_seller",
     }
     seller_start_phrases = [
         "you just received an order from",
@@ -2068,9 +2148,17 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
         "you received an order from",
         "you've received an order from",
         "great news: you've received an order from",
+        "you've received a milestones order from",
+        "you've just received a milestones order from",
+        "you received a milestones order from",
     ]
+    is_milestone_start = (
+        email_name == "milestones_gig_order_started_to_seller"
+        or bool(re.search(r"\breceived a milestones? order from\b", normalized))
+    )
     is_seller_start = (
-        email_name in seller_start_email_names
+        is_milestone_start
+        or email_name in seller_start_email_names
         or any(phrase in normalized for phrase in seller_start_phrases)
     )
 
@@ -2085,17 +2173,19 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
         if not order_id:
             return FiverrDecision("quarantine", "missing_order_id")
         client_name = extract_client_name(email.subject, text) or "Fiverr Client"
-        due = extract_due_datetime(text, email.subject)
+        due, due_reason = parse_due_datetime(text, email.subject)
         if due:
             return FiverrDecision(
                 "create",
                 "requirements_received_order_started",
                 FiverrOrder(order_id, client_name, due, source, email.message_id, email.received_at),
             )
+        if due_reason != "missing_due_date":
+            return FiverrDecision("quarantine", due_reason)
         return FiverrDecision(
             "create_after_requirements",
             "requirements_received_missing_due",
-            FiverrOrder(order_id, client_name, datetime.now(tz=TZ), source, email.message_id, email.received_at),
+            FiverrOrder(order_id, client_name, None, source, email.message_id, email.received_at),
         )
 
     waiting_for_requirements_markers = [
@@ -2126,9 +2216,12 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
         return FiverrDecision("quarantine", "missing_order_id")
 
     client_name = extract_client_name(email.subject, text) or "Fiverr Client"
-    due = extract_due_datetime(text, email.subject)
+    due, due_reason = parse_due_datetime(text, email.subject)
     if not due:
-        return FiverrDecision("quarantine", "missing_due_date", FiverrOrder(order_id, client_name, datetime.now(tz=TZ), source, email.message_id, email.received_at))
+        order = FiverrOrder(order_id, client_name, None, source, email.message_id, email.received_at)
+        if is_milestone_start and due_reason == "missing_due_date":
+            return FiverrDecision("create_topic_pending_due", "milestone_awaiting_due", order)
+        return FiverrDecision("quarantine", due_reason, order)
 
     return FiverrDecision(
         "create",
@@ -2261,7 +2354,15 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
     if row and row["task_id"]:
         logging.info("Duplicate Fiverr order %s ignored; task already exists", order.order_id)
         return
-    if row and not inserted:
+    pending_topic = (
+        row["topic_thread_id"]
+        if row and row["status"] == "awaiting_due" and row["chat_id"] == chat_id_int
+        else None
+    )
+    if pending_topic and decision.action == "create_topic_pending_due":
+        logging.info("Duplicate milestone order %s ignored; topic already awaits a deadline", order.order_id)
+        return
+    if row and not inserted and not pending_topic:
         save_inbound_quarantine(
             source=source,
             message_id=email.message_id,
@@ -2273,12 +2374,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         logging.warning("Quarantined retry for incompletely created Fiverr order %s", order.order_id)
         return
 
-    deadline_local = (order.due - timedelta(days=1)).astimezone(TZ)
-    deadline_utc = deadline_local.astimezone(ZoneInfo("UTC"))
-
-    title = f"Fiverr order #{order.order_id}"
-
-    thread_id = await create_fiverr_order_topic(application, chat_id_int, order)
+    thread_id = pending_topic or await create_fiverr_order_topic(application, chat_id_int, order)
     if thread_id is None:
         save_inbound_quarantine(
             source=source,
@@ -2290,15 +2386,20 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         mark_fiverr_order_quarantined(order.order_id, "topic_create_failed")
         return
 
-    task_id = save_task(
-        title=title,
-        assignee="@unassigned",
-        deadline_utc=deadline_utc,
-        creator_id=int(owner_id),
-        chat_id=chat_id_int,
-        thread_id=thread_id,
-    )
-    mark_fiverr_order_created(order.order_id, task_id, thread_id)
+    if decision.action == "create_topic_pending_due":
+        mark_fiverr_order_awaiting_due(order.order_id, thread_id)
+        logging.info("Created milestone topic for %s; awaiting an explicit deadline", order.order_id)
+        return
+
+    # Only dated create decisions reach task/reminder creation.
+    if order.due is None:
+        raise ValueError("A verified deadline is required to create a Fiverr task")
+    deadline_local = (order.due - timedelta(days=1)).astimezone(TZ)
+    deadline_utc = deadline_local.astimezone(ZoneInfo("UTC"))
+    task_id = save_fiverr_task(order, deadline_utc, int(owner_id), chat_id_int, thread_id)
+    if task_id is None:
+        logging.warning("Fiverr order %s changed during task creation; no duplicate task inserted", order.order_id)
+        return
 
     task = get_task(task_id, chat_id_int)
     if task:
@@ -2355,6 +2456,11 @@ async def handle_gmail_webhook(request: web.Request, application: Application) -
         gmail_thread_id=payload.get("threadId", "") or "",
         received_at=payload.get("date", "") or payload.get("receivedAt", "") or "",
     )
+    # Acknowledge only after the webhook can durably handle the email. Without
+    # routing/owner configuration, Apps Script must retain it for a later retry.
+    if not get_setting("general_chat_id") or not get_setting("owner_user_id"):
+        logging.warning("Gmail intake is not configured; email left for retry")
+        return web.Response(status=503, text="intake not configured")
     await process_inbound_email(application, email, source="Gmail")
     return web.Response(status=200, text="ok")
 

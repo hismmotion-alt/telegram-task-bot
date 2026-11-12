@@ -130,6 +130,15 @@ const cases = {
     ])]); h.run();
     assert.equal(h.calls.length, 4);
   },
+  'HTML-only work-plan start passes the existing order-ID gate'() {
+    const h = harness([thread('t', [message('work-plan', {
+      subject: 'Start your project aligned from day one', body: '',
+      html: '<p>Your order FO444455556666 with samplebuyer due on Nov 20, 2026 is now in progress:</p><a href="https://fiverr.com/orders/FO444455556666?email_name=work_plan_order_started">Plan</a>',
+    })])]); h.run();
+    assert.equal(h.calls.length, 1);
+    h.run();
+    assert.equal(h.calls.length, 1);
+  },
   'valid order ID alone in HTML is a candidate'() {
     const h = harness([thread('t', [message('html-id', {
       subject: 'Order update', body: '', html: '<a href="https://example.test/orders/FO12345678">View</a>',

@@ -157,6 +157,52 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(orders[0]["order_id"], "FO1234567890")
         self.assertEqual(len(tasks), 1)
 
+    async def test_work_plan_start_html_creates_once_and_separate_from_same_buyer(self):
+        previous = email("You received an order from samplebuyer",
+                         "Order #FO111122223333 is due Nov 18, 2026.")
+        await main.process_inbound_email(self.app, previous, "Gmail")
+        inbound = email("Start your project aligned from day one", html_body=
+            '<p>Your order <b>FO444455556666</b> with samplebuyer due on Nov 20, 2026 is now in progress:</p>'
+            '<a href="https://fiverr.com/orders/FO444455556666?email_name=work_plan_order_started">Create work plan</a>',
+            message_id="synthetic-work-plan")
+        decision = main.classify_fiverr_email(inbound, "Gmail")
+        self.assertEqual(decision.action, "create")
+        self.assertEqual(decision.order.client_name, "samplebuyer")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 2)
+        self.assertEqual(self.app.bot.created_topics[-1][1], "samplebuyer - FO444455556666")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 2)
+
+    async def test_work_plan_start_without_verified_template_is_quarantined(self):
+        inbound = email("Start your project aligned from day one",
+            "Your order FO444455556666 with samplebuyer due on Nov 20, 2026 is now in progress:")
+        self.assertEqual(main.classify_fiverr_email(inbound, "Gmail").action, "quarantine")
+
+    async def test_work_plan_body_does_not_override_nonstart_template(self):
+        for template, expected in (("work_plan_order_created", "defer"),
+                                   ("view_requirements_reminder", "ignore"),
+                                   ("work_plan_order_started_to_buyer", "quarantine")):
+            inbound = email("Start your project aligned from day one",
+                "Your order FO444455556666 with samplebuyer due on Nov 20, 2026 is now in progress:",
+                html_body=f'<a href="https://fiverr.com/orders/FO444455556666?email_name={template}">View</a>')
+            self.assertEqual(main.classify_fiverr_email(inbound, "Gmail").action, expected)
+
+    async def test_work_plan_start_still_requires_valid_deadline(self):
+        for body in ("", "Due tomorrow.", "Due Nov 20, 2026. Deadline Nov 21, 2026."):
+            inbound = email("Start your project aligned from day one", body,
+                html_body='<a href="https://fiverr.com/orders/FO444455556666?email_name=work_plan_order_started">Plan</a>')
+            self.assertEqual(main.classify_fiverr_email(inbound, "Gmail").action, "quarantine")
+            await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(self.app.bot.created_topics, [])
+
+    async def test_work_plan_buyer_notification_not_treated_as_seller_start(self):
+        inbound = email("Start your project aligned from day one",
+            "Your order FO444455556666 with samplebuyer due on Nov 20, 2026 is now in progress:",
+            html_body='<a href="https://fiverr.com/orders/FO444455556666?email_name=gig_order_created_to_buyer">View</a>')
+        self.assertEqual(main.classify_fiverr_email(inbound, "Gmail").action, "ignore")
+
     async def test_milestone_order_without_due_creates_topic_without_task_or_invented_deadline(self):
         inbound = email(
             "Great news: You've received a milestones order from buyer7",

@@ -2140,6 +2140,7 @@ def classify_fiverr_email(email: InboundEmail, source: str) -> FiverrDecision:
     seller_start_email_names = {
         "gig_order_started_seller",
         "gig_order_with_requirements_started_to_seller",
+        "work_plan_order_started",
         "milestones_gig_order_started_to_seller",
     }
     seller_start_phrases = [

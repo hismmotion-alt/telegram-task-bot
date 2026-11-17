@@ -2292,6 +2292,22 @@ async def process_inbound_order(application: Application, subject: str, body: st
     await process_inbound_email(application, email, source)
 
 
+async def notify_fiverr_pending_deadline(application, order, chat_id, thread_id, reason):
+    key = f"intake_pending_due:{chat_id}:{order.order_id}"
+    await send_scheduled_message(
+        application.bot, key, chat_id,
+        f"⚠️ Order #{order.order_id} received. This topic is linked to the order.\n"
+        f"The delivery deadline needs verification ({reason}). "
+        "No task or reminders have been scheduled.\n"
+        f"{fiverr_order_url(order.order_id)}",
+        thread_id=thread_id,
+    )
+    with get_db() as conn:
+        row = conn.execute("SELECT state FROM scheduled_sends WHERE key = ?", (key,)).fetchone()
+    if row and row["state"] == "failed":
+        raise RuntimeError("Pending-deadline warning failed; leave email retryable")
+
+
 async def quarantine_inbound_email(application: Application, chat_id: int, **details) -> None:
     """Persist intake failures and surface them once, rather than silently ACKing."""
     save_inbound_quarantine(**details)
@@ -2335,6 +2351,16 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
 
     decision = classify_fiverr_email(email, source)
     order_id = decision.order.order_id if decision.order else extract_fiverr_order_id(email_search_text(email))
+    logging.info("Fiverr intake source=%s message_id=%s order_id=%s action=%s reason=%s",
+                 source, email.message_id, order_id, decision.action, decision.reason)
+    # A verified seller-start order must not disappear merely because its
+    # deadline cannot be parsed. Retain the evidence, create only a topic, and
+    # require a verified later deadline before tasks/reminders are enabled.
+    if decision.action == "quarantine" and decision.order and decision.reason in {
+        "missing_due_date", "invalid_due_date", "conflicting_due_dates",
+    }:
+        save_inbound_quarantine(source, email.message_id, order_id, decision.reason, email.subject)
+        decision = FiverrDecision("create_topic_pending_due", decision.reason, decision.order)
     if decision.action == "ignore":
         logging.info("Ignored %s inbound email: %s", source, decision.reason)
         return
@@ -2386,7 +2412,9 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         else None
     )
     if pending_topic and decision.action == "create_topic_pending_due":
-        logging.info("Duplicate milestone order %s ignored; topic already awaits a deadline", order.order_id)
+        logging.info("Duplicate order %s ignored; topic already awaits a deadline", order.order_id)
+        if decision.reason != "milestone_awaiting_due":
+            await notify_fiverr_pending_deadline(application, order, chat_id_int, pending_topic, decision.reason)
         return
     if row and not inserted and not pending_topic:
         await quarantine_inbound_email(application, chat_id_int,
@@ -2414,7 +2442,9 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
 
     if decision.action == "create_topic_pending_due":
         mark_fiverr_order_awaiting_due(order.order_id, thread_id)
-        logging.info("Created milestone topic for %s; awaiting an explicit deadline", order.order_id)
+        logging.info("Created order topic for %s; awaiting an explicit deadline", order.order_id)
+        if decision.reason != "milestone_awaiting_due":
+            await notify_fiverr_pending_deadline(application, order, chat_id_int, thread_id, decision.reason)
         return
 
     # Only dated create decisions reach task/reminder creation.

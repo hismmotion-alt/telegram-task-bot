@@ -62,11 +62,12 @@ Use a Google Apps Script to forward Fiverr emails to the bot.
   `Delivery date: 2026-11-20`. Incomplete, unsupported, or conflicting deadlines
   are quarantined instead of guessed. A later requirements email can use a stored
   pending deadline only when it contains no new deadline evidence.
-- A recognized milestone order with an order ID and genuinely missing deadline
-  creates one topic in `awaiting_due` state, without a task, reminders, or intro
-  messages. Replay and restart reuse that topic. A later explicit valid deadline
-  upgrades it to a task in the same topic; task creation and order linkage commit
-  atomically. Invalid or conflicting deadlines remain quarantined.
+- A verified seller-start email with an order ID creates one topic even when its
+  deadline is missing, malformed or conflicting. It remains in `awaiting_due`
+  state without tasks or reminders. Ordinary and invalid-deadline starts include
+  a deduplicated explanation in the topic; date validation is not relaxed.
+  Replay/restart reuse that topic; a later verified deadline upgrades it atomically.
+  Other unrecognized/unsafe messages remain quarantined and visibly alerted.
   Verify existing Telegram/database records before recovering historical orders.
   Do not replay an uncertain topic-creation attempt blindly.
 

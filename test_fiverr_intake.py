@@ -195,7 +195,8 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
                 html_body='<a href="https://fiverr.com/orders/FO444455556666?email_name=work_plan_order_started">Plan</a>')
             self.assertEqual(main.classify_fiverr_email(inbound, "Gmail").action, "quarantine")
             await main.process_inbound_email(self.app, inbound, "Gmail")
-        self.assertEqual(self.app.bot.created_topics, [])
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(self.app.job_queue.jobs(), [])
 
     async def test_work_plan_buyer_notification_not_treated_as_seller_start(self):
         inbound = email("Start your project aligned from day one",
@@ -292,10 +293,11 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(row["task_id"])
         self.assertEqual(len(self.app.bot.created_topics), 1)
 
-    async def test_milestone_with_invalid_date_does_not_create_topic(self):
+    async def test_milestone_with_invalid_date_creates_pending_topic_not_task(self):
         inbound = email("You've received a milestones order from buyer7", "Order #FO1234AB56789. Due tomorrow.")
         await main.process_inbound_email(self.app, inbound, "Gmail")
-        self.assertEqual(self.app.bot.created_topics, [])
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(self.app.job_queue.jobs(), [])
         with main.get_db() as conn:
             self.assertEqual(conn.execute("SELECT reason FROM inbound_quarantine").fetchone()[0], "invalid_due_date")
 
@@ -586,7 +588,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["reason"], "missing_due_date")
 
     async def test_quarantine_warning_dedupes_across_replay_and_restart(self):
-        inbound = email("You received an order from samplebuyer",
+        inbound = email("Unrecognized Fiverr order notification",
                         "Order #FO9999999999 has no deadline available.")
         await main.process_inbound_email(self.app, inbound, "Gmail")
         await main.process_inbound_email(self.app, inbound, "Gmail")
@@ -598,7 +600,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.bot.created_topics, [])
 
     async def test_quarantine_definite_warning_failure_is_retryable(self):
-        inbound = email("You received an order from samplebuyer", "Order #FO9999999999.")
+        inbound = email("Unrecognized Fiverr order notification", "Order #FO9999999999.")
         self.app.bot.send_exceptions = [BadRequest("synthetic failure")]
         with self.assertRaisesRegex(RuntimeError, "warning delivery failed"):
             await main.process_inbound_email(self.app, inbound, "Gmail")
@@ -607,12 +609,47 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.bot.created_topics, [])
 
     async def test_quarantine_uncertain_warning_does_not_blindly_resend(self):
-        inbound = email("You received an order from samplebuyer", "Order #FO9999999999.")
+        inbound = email("Unrecognized Fiverr order notification", "Order #FO9999999999.")
         self.app.bot.send_exceptions = [main.TimedOut("synthetic timeout")]
         await main.process_inbound_email(self.app, inbound, "Gmail")
         await main.process_inbound_email(self.app, inbound, "Gmail")
         self.assertEqual(self.app.bot.messages, [])
         self.assertEqual(main.scheduled_send_issues()[0]["state"], "uncertain")
+
+    async def test_invalid_ordinary_deadline_topic_replay_restart_and_upgrade(self):
+        inbound = email("You've received an order from samplebuyer",
+                        "Order #FO1234567890 is due Nov 19, 2026. Revised deadline tomorrow.")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        restarted = FakeApplication()
+        await main.process_inbound_email(restarted, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(restarted.bot.created_topics, [])
+        self.assertEqual(restarted.bot.messages, [])
+        self.assertEqual(self.app.job_queue.jobs(), [])
+        with main.get_db() as conn:
+            row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
+            self.assertEqual(row["status"], "awaiting_due")
+            self.assertIsNone(row["task_id"])
+        dated = email("You've received an order from samplebuyer",
+                      "Order #FO1234567890 is due Nov 19, 2026 at 11:42 AM PST.", message_id="verified")
+        await main.process_inbound_email(restarted, dated, "Gmail")
+        await main.process_inbound_email(restarted, dated, "Gmail")
+        self.assertEqual(restarted.bot.created_topics, [])
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT topic_thread_id FROM fiverr_orders").fetchone()[0], row["topic_thread_id"])
+
+    async def test_pending_deadline_warning_failure_retries_without_new_topic(self):
+        inbound = email("You've received an order from samplebuyer", "Order #FO1234567890. Due tomorrow.")
+        self.app.bot.send_exceptions = [BadRequest("synthetic failure")]
+        with self.assertRaisesRegex(RuntimeError, "warning failed"):
+            await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(self.app.job_queue.jobs(), [])
 
     async def test_ordinary_seller_html_date_fixture_recognized(self):
         inbound = email("Great news: You've received an order from samplebuyer", html_body=

@@ -585,6 +585,44 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             row = conn.execute("SELECT * FROM inbound_quarantine").fetchone()
         self.assertEqual(row["reason"], "missing_due_date")
 
+    async def test_quarantine_warning_dedupes_across_replay_and_restart(self):
+        inbound = email("You received an order from samplebuyer",
+                        "Order #FO9999999999 has no deadline available.")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        restarted = FakeApplication()
+        await main.process_inbound_email(restarted, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertIn("needs attention", self.app.bot.messages[0]["text"])
+        self.assertEqual(restarted.bot.messages, [])
+        self.assertEqual(self.app.bot.created_topics, [])
+
+    async def test_quarantine_definite_warning_failure_is_retryable(self):
+        inbound = email("You received an order from samplebuyer", "Order #FO9999999999.")
+        self.app.bot.send_exceptions = [BadRequest("synthetic failure")]
+        with self.assertRaisesRegex(RuntimeError, "warning delivery failed"):
+            await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(self.app.bot.created_topics, [])
+
+    async def test_quarantine_uncertain_warning_does_not_blindly_resend(self):
+        inbound = email("You received an order from samplebuyer", "Order #FO9999999999.")
+        self.app.bot.send_exceptions = [main.TimedOut("synthetic timeout")]
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(self.app.bot.messages, [])
+        self.assertEqual(main.scheduled_send_issues()[0]["state"], "uncertain")
+
+    async def test_ordinary_seller_html_date_fixture_recognized(self):
+        inbound = email("Great news: You've received an order from samplebuyer", html_body=
+            '<div>You just received an order from samplebuyer</div>'
+            '<p>Order <b>#FO1234567890</b> is due <span>Nov 19, 2026</span>.</p>'
+            '<a href="https://fiverr.com/orders/FO1234567890?email_name=gig_order_started_to_seller">View</a>')
+        decision = main.classify_fiverr_email(inbound, "Gmail")
+        self.assertEqual(decision.action, "create")
+        self.assertEqual(decision.order.order_id, "FO1234567890")
+
     async def test_cutover_does_not_replay_existing_processed_followups(self):
         inbound = email(
             "Reminder: complete requirements",

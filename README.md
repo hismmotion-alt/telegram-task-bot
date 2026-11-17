@@ -53,6 +53,10 @@ Use a Google Apps Script to forward Fiverr emails to the bot.
 - HTTP 200 with body `ok` acknowledges a handled email (created, ignored, deferred,
   or quarantined). Transport failures, other responses, and missing bot routing or
   owner settings remain retryable.
+- Quarantined intake now posts a deduplicated warning in the configured General
+  topic instead of failing only in logs. A definite warning-delivery rejection
+  keeps the email retryable; uncertain sends remain in `/task sendissues` for
+  reconciliation rather than risking duplicate messages.
 - Ordinary and milestones order templates are supported. A deadline must contain
   an explicit full calendar date, such as `Due Nov 20, 2026` or
   `Delivery date: 2026-11-20`. Incomplete, unsupported, or conflicting deadlines

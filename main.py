@@ -2292,6 +2292,31 @@ async def process_inbound_order(application: Application, subject: str, body: st
     await process_inbound_email(application, email, source)
 
 
+async def quarantine_inbound_email(application: Application, chat_id: int, **details) -> None:
+    """Persist intake failures and surface them once, rather than silently ACKing."""
+    save_inbound_quarantine(**details)
+    identity = details.get("order_id") or details.get("message_id") or details["subject"]
+    digest = hashlib.sha256(f"{details['source']}:{identity}:{details['reason']}".encode()).hexdigest()[:24]
+    key = f"intake_issue:{chat_id}:{digest}"
+    owner = get_setting("owner_username") or "@smbath7"
+    order_label = details.get("order_id") or "unidentified order"
+    thread = get_setting("general_thread_id")
+    await send_scheduled_message(
+        application.bot, key, chat_id,
+        f"⚠️ {owner}, a Fiverr order needs attention: {order_label}.\n"
+        f"Reason: {details['reason']}. No new task was created for this email.\n"
+        "Check the order before replaying it; a topic may already exist. "
+        "Do not infer a deadline from this notice.",
+        thread_id=int(thread) if thread else None,
+    )
+    with get_db() as conn:
+        state = conn.execute("SELECT state FROM scheduled_sends WHERE key = ?", (key,)).fetchone()
+    if state and state["state"] == "failed":
+        # Definite rejection is retryable. Uncertain Telegram sends retain their
+        # ledger record for /task sendissues and must not be blindly duplicated.
+        raise RuntimeError("Intake warning delivery failed; leave email retryable")
+
+
 async def process_inbound_email(application: Application, email: InboundEmail, source: str) -> None:
     chat_id = get_setting("general_chat_id")
     if not chat_id:
@@ -2330,7 +2355,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             )
             decision = FiverrDecision("create", "requirements_received_order_started", decision.order)
         else:
-            save_inbound_quarantine(
+            await quarantine_inbound_email(application, chat_id_int,
                 source=source,
                 message_id=email.message_id,
                 order_id=decision.order.order_id,
@@ -2340,7 +2365,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             logging.warning("Quarantined %s inbound email: missing due date for requirements-received order", source)
             return
     if decision.action == "quarantine" or not decision.order:
-        save_inbound_quarantine(
+        await quarantine_inbound_email(application, chat_id_int,
             source=source,
             message_id=email.message_id,
             order_id=order_id,
@@ -2364,7 +2389,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         logging.info("Duplicate milestone order %s ignored; topic already awaits a deadline", order.order_id)
         return
     if row and not inserted and not pending_topic:
-        save_inbound_quarantine(
+        await quarantine_inbound_email(application, chat_id_int,
             source=source,
             message_id=email.message_id,
             order_id=order.order_id,
@@ -2377,7 +2402,7 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
 
     thread_id = pending_topic or await create_fiverr_order_topic(application, chat_id_int, order)
     if thread_id is None:
-        save_inbound_quarantine(
+        await quarantine_inbound_email(application, chat_id_int,
             source=source,
             message_id=email.message_id,
             order_id=order.order_id,

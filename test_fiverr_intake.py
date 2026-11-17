@@ -651,6 +651,36 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.app.bot.messages), 1)
         self.assertEqual(self.app.job_queue.jobs(), [])
 
+    async def test_recent_quarantine_recovery_creates_only_pending_and_dedupes(self):
+        main.save_inbound_quarantine("Gmail", "sample-id", "FO1234567890", "invalid_due_date",
+                                    "You've received an order from samplebuyer")
+        await main.recover_recent_deadline_quarantines(self.app)
+        await main.recover_recent_deadline_quarantines(self.app)
+        restarted = FakeApplication()
+        await main.recover_recent_deadline_quarantines(restarted)
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(restarted.bot.created_topics, [])
+        self.assertEqual(self.app.job_queue.jobs(), [])
+        with main.get_db() as conn:
+            order = conn.execute("SELECT * FROM fiverr_orders").fetchone()
+            self.assertEqual(order["status"], "awaiting_due")
+            self.assertIsNone(order["task_id"])
+            self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM inbound_quarantine").fetchone()[0], 1)
+
+    async def test_recent_recovery_skips_old_unknown_existing_and_uncertain(self):
+        for index in range(5):
+            main.save_inbound_quarantine("Gmail", f"sample-{index}", f"FO123456789{index}", "invalid_due_date",
+                "Unknown message" if index == 0 else "You've received an order from samplebuyer")
+        with main.get_db() as conn:
+            conn.execute("UPDATE inbound_quarantine SET created_at_utc = '2000-01-01T00:00:00+00:00' WHERE order_id = 'FO1234567891'")
+        order = main.FiverrOrder("FO1234567892", "samplebuyer", None, "Gmail", "sample-2")
+        main.reserve_fiverr_order(order, -100123)  # Any ledger state, including processing, blocks replay.
+        main.save_topic(-100123, "samplebuyer - FO1234567893", 777)
+        main.save_inbound_quarantine("Gmail", "sample-4", "FO1234567894", "uncertain_create_retry",
+                                    "You've received an order from samplebuyer")
+        await main.recover_recent_deadline_quarantines(self.app)
+        self.assertEqual(self.app.bot.created_topics, [])
+
     async def test_ordinary_seller_html_date_fixture_recognized(self):
         inbound = email("Great news: You've received an order from samplebuyer", html_body=
             '<div>You just received an order from samplebuyer</div>'

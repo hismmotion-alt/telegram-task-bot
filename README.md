@@ -70,6 +70,10 @@ Use a Google Apps Script to forward Fiverr emails to the bot.
   Other unrecognized/unsafe messages remain quarantined and visibly alerted.
   Verify existing Telegram/database records before recovering historical orders.
   Do not replay an uncertain topic-creation attempt blindly.
+- On startup, recent (48-hour) deadline quarantines can be recovered as pending
+  topics only when the stored seller-start subject is recognized and there is
+  no order ledger, task, matching topic record, or prior uncertain creation.
+  Quarantine history is preserved. Recovery never supplies a deadline.
 
 ## Tests
 Run the offline suites after installing requirements (Node.js is also needed):

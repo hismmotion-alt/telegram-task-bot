@@ -3704,8 +3704,56 @@ async def handle_order_assign_callback(update: Update, context: ContextTypes.DEF
     await send_assignee_prompt_to_chat(context.bot, chat_id, task.thread_id, refreshed)
 
 
+async def recover_recent_deadline_quarantines(app: Application, now: Optional[datetime] = None) -> None:
+    """Recover only clearly never-created recent seller starts, without deadlines."""
+    chat_id = get_setting("general_chat_id")
+    if not chat_id or not get_setting("owner_user_id"):
+        return
+    cutoff = ((now or datetime.now(tz=ZoneInfo("UTC"))) - timedelta(days=2)).isoformat()
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT q.* FROM inbound_quarantine q
+            WHERE q.created_at_utc >= ?
+              AND q.reason IN ('missing_due_date', 'invalid_due_date', 'conflicting_due_dates')
+              AND q.order_id IS NOT NULL
+              AND q.id = (SELECT MAX(q2.id) FROM inbound_quarantine q2 WHERE q2.order_id = q.order_id)
+              AND NOT EXISTS (SELECT 1 FROM fiverr_orders f WHERE f.order_id = q.order_id)
+              AND NOT EXISTS (SELECT 1 FROM tasks t WHERE instr(upper(t.title), q.order_id) > 0)
+              AND NOT EXISTS (SELECT 1 FROM topics t WHERE instr(upper(t.name), q.order_id) > 0)
+              AND NOT EXISTS (SELECT 1 FROM inbound_quarantine bad WHERE bad.order_id = q.order_id
+                              AND bad.reason IN ('topic_create_failed', 'uncertain_create_retry'))
+            ORDER BY q.id LIMIT 100
+        """, (cutoff,)).fetchall()
+    for row in rows:
+        if not re.fullmatch(r"FO[A-Z0-9]{8,}", row["order_id"]):
+            continue
+        inbound = InboundEmail(
+            subject=row["subject"], body=f"Order #{row['order_id']}.",
+            message_id=row["message_id"] or "", received_at=row["created_at_utc"],
+        )
+        decision = classify_fiverr_email(inbound, row["source"])
+        # No fabricated body deadline and no inferred recognition from an ID.
+        # Only the saved original seller-start subject can authorize this route.
+        if not decision.order or decision.order.due is not None or decision.reason not in {
+            "missing_due_date", "milestone_awaiting_due",
+        }:
+            continue
+        try:
+            await process_inbound_email(app, inbound, row["source"])
+        except Exception as exc:
+            logging.warning("Recent intake recovery order=%s interrupted: %s", row["order_id"], type(exc).__name__)
+            continue
+        with get_db() as conn:
+            result = conn.execute("SELECT status, topic_thread_id, task_id FROM fiverr_orders WHERE order_id = ?",
+                                  (row["order_id"],)).fetchone()
+        if result:
+            logging.info("Recent intake recovery order=%s state=%s topic=%s task=%s",
+                         row["order_id"], result["status"], result["topic_thread_id"], result["task_id"])
+
+
 async def on_startup(app: Application) -> None:
     mark_stale_pending_sends_uncertain()
+    await recover_recent_deadline_quarantines(app)
     # Reschedule reminders for existing open tasks
     with get_db() as conn:
         rows = conn.execute(

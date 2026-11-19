@@ -44,7 +44,7 @@ class Task:
     id: int
     title: str
     assignee: str
-    deadline_utc: datetime
+    deadline_utc: Optional[datetime]
     creator_id: int
     chat_id: int
     thread_id: Optional[int]
@@ -123,15 +123,64 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def migrate_optional_task_deadline(conn: sqlite3.Connection) -> None:
+    """Rebuild only the deadline constraint, transactionally preserving schema/data."""
+    columns = conn.execute("PRAGMA table_info(tasks)").fetchall()
+    deadline = next((col for col in columns if col["name"] == "deadline_utc"), None)
+    if not deadline or not deadline["notnull"]:
+        return
+    if conn.execute("PRAGMA foreign_keys").fetchone()[0]:
+        raise RuntimeError("Task rebuild requires foreign_keys disabled before the transaction")
+    original = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()[0]
+    schema, changes = re.subn(r'(?i)(\bdeadline_utc\s+TEXT)\s+NOT\s+NULL\b', r'\1', original, count=1)
+    if changes != 1:
+        raise RuntimeError("Unsupported tasks schema; optional-deadline migration left unchanged")
+    schema, renamed = re.subn(r'(?i)^(CREATE\s+TABLE\s+)(?:"tasks"|`tasks`|\[tasks\]|tasks)(?=\s|\()',
+                              r'\1tasks_optional_deadline_migration', schema, count=1)
+    if renamed != 1:
+        raise RuntimeError("Unsupported tasks table declaration; migration left unchanged")
+    objects = conn.execute("SELECT sql FROM sqlite_master WHERE tbl_name='tasks' AND type IN ('index','trigger') AND sql IS NOT NULL").fetchall()
+    sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='tasks'").fetchone()
+    # Original CREATE preserves extra columns, defaults and table constraints.
+    # Explicit columns preserve IDs/links; sequence preserves IDs of deleted rows.
+    names = [row["name"] for row in conn.execute("PRAGMA table_xinfo(tasks)") if row["hidden"] == 0]
+    quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in names)
+    legacy_alter = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("SAVEPOINT optional_task_deadline")
+    try:
+        conn.execute(schema)
+        conn.execute(f"INSERT INTO tasks_optional_deadline_migration ({quoted}) SELECT {quoted} FROM tasks")
+        conn.execute("DROP TABLE tasks")
+        # Views still reference the final tasks name during the short rebuild.
+        # Avoid rewriting/validating them while that name is temporarily absent.
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        conn.execute("ALTER TABLE tasks_optional_deadline_migration RENAME TO tasks")
+        conn.execute(f"PRAGMA legacy_alter_table = {int(legacy_alter)}")
+        for obj in objects:
+            conn.execute(obj["sql"])
+        if sequence:
+            updated = conn.execute("UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name='tasks'", (sequence["seq"],)).rowcount
+            if not updated:
+                conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('tasks', ?)", (sequence["seq"],))
+        conn.execute("RELEASE SAVEPOINT optional_task_deadline")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT optional_task_deadline")
+        conn.execute("RELEASE SAVEPOINT optional_task_deadline")
+        raise
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table = {int(legacy_alter)}")
+
+
 def init_db() -> None:
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 assignee TEXT NOT NULL,
-                deadline_utc TEXT NOT NULL,
+                deadline_utc TEXT,
                 creator_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
                 message_thread_id INTEGER,
@@ -313,6 +362,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN message_thread_id INTEGER")
         if "completed_at_utc" not in cols:
             conn.execute("ALTER TABLE tasks ADD COLUMN completed_at_utc TEXT")
+        migrate_optional_task_deadline(conn)
         scheduled_cols = [row["name"] for row in conn.execute("PRAGMA table_info(scheduled_sends)").fetchall()]
         if "chat_id" not in scheduled_cols:
             conn.execute("ALTER TABLE scheduled_sends ADD COLUMN chat_id INTEGER")
@@ -359,11 +409,15 @@ def parse_deadline(date_str: str, time_str: str) -> datetime:
     return dt_local.replace(tzinfo=TZ).astimezone(ZoneInfo("UTC"))
 
 
-def format_deadline_local(deadline_utc: datetime) -> str:
+def format_deadline_local(deadline_utc: Optional[datetime]) -> str:
+    if deadline_utc is None:
+        return "Not set"
     return deadline_utc.astimezone(TZ).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def deadline_from_row(row: sqlite3.Row) -> datetime:
+def deadline_from_row(row: sqlite3.Row) -> Optional[datetime]:
+    if row["deadline_utc"] is None:
+        return None
     return datetime.fromisoformat(row["deadline_utc"]).astimezone(ZoneInfo("UTC"))
 
 
@@ -383,7 +437,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
 def save_task(
     title: str,
     assignee: str,
-    deadline_utc: datetime,
+    deadline_utc: Optional[datetime],
     creator_id: int,
     chat_id: int,
     thread_id: Optional[int],
@@ -397,7 +451,7 @@ def save_task(
             (
                 title,
                 assignee,
-                deadline_utc.isoformat(),
+                deadline_utc.isoformat() if deadline_utc is not None else None,
                 creator_id,
                 chat_id,
                 thread_id,
@@ -476,7 +530,7 @@ def mark_all_tasks_done_global(chat_id: int) -> int:
 def list_open_tasks(chat_id: int) -> list[Task]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' ORDER BY deadline_utc ASC",
+            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' ORDER BY deadline_utc IS NULL, deadline_utc ASC",
             (chat_id,),
         ).fetchall()
         return [task_from_row(r) for r in rows]
@@ -486,12 +540,12 @@ def list_open_tasks_by_thread(chat_id: int, thread_id: Optional[int]) -> list[Ta
     with get_db() as conn:
         if thread_id is None:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND message_thread_id IS NULL ORDER BY deadline_utc ASC",
+                "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND message_thread_id IS NULL ORDER BY deadline_utc IS NULL, deadline_utc ASC",
                 (chat_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND message_thread_id = ? ORDER BY deadline_utc ASC",
+                "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND message_thread_id = ? ORDER BY deadline_utc IS NULL, deadline_utc ASC",
                 (chat_id, thread_id),
             ).fetchall()
         return [task_from_row(r) for r in rows]
@@ -501,7 +555,7 @@ def find_tasks_by_title(chat_id: int, query: str) -> list[Task]:
     pattern = f"%{query}%"
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND title LIKE ? ORDER BY deadline_utc ASC",
+            "SELECT * FROM tasks WHERE chat_id = ? AND status != 'done' AND title LIKE ? ORDER BY deadline_utc IS NULL, deadline_utc ASC",
             (chat_id, pattern),
         ).fetchall()
         return [task_from_row(r) for r in rows]
@@ -1199,7 +1253,7 @@ def reserve_fiverr_order(order: FiverrOrder, chat_id: int) -> tuple[Optional[sql
 
 def save_fiverr_task(
     order: FiverrOrder,
-    deadline_utc: datetime,
+    deadline_utc: Optional[datetime],
     creator_id: int,
     chat_id: int,
     topic_thread_id: int,
@@ -1220,7 +1274,7 @@ def save_fiverr_task(
             INSERT INTO tasks (title, assignee, deadline_utc, creator_id, chat_id, message_thread_id, status, created_at_utc)
             VALUES (?, '@unassigned', ?, ?, ?, ?, 'assigned', ?)
             """,
-            (f"Fiverr order #{order.order_id}", deadline_utc.isoformat(), creator_id, chat_id, topic_thread_id, now),
+            (f"Fiverr order #{order.order_id}", deadline_utc.isoformat() if deadline_utc else None, creator_id, chat_id, topic_thread_id, now),
         )
         task_id = int(cursor.lastrowid)
         conn.execute(
@@ -1382,7 +1436,9 @@ def fiverr_order_url(order_id: str) -> str:
     return f"https://www.fiverr.com/users/funanimation1/manage_orders/{order_id}"
 
 
-def deadline_detail(deadline_utc: datetime, now: Optional[datetime] = None) -> str:
+def deadline_detail(deadline_utc: Optional[datetime], now: Optional[datetime] = None) -> str:
+    if deadline_utc is None:
+        return "Not set"
     now_utc = (now or datetime.now(tz=ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
     deadline_utc = deadline_utc.astimezone(ZoneInfo("UTC"))
     remaining = deadline_utc - now_utc
@@ -1518,6 +1574,9 @@ async def send_assignee_prompt_to_chat(
 
 
 async def schedule_task_jobs(application: Application, task: Task) -> None:
+    if task.deadline_utc is None:
+        cancel_task_jobs(application, task.id)
+        return
     # Schedule reminders 24h and 1h before deadline
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
     offsets = [(timedelta(hours=24), "(24h)"), (timedelta(hours=1), "(1h)")]
@@ -1554,7 +1613,7 @@ async def remind_task_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     label = data["label"]
 
     task = get_task(task_id, chat_id)
-    if not task or task.status == "done":
+    if not task or task.status == "done" or task.deadline_utc is None:
         return
 
     await context.bot.send_message(
@@ -1570,7 +1629,7 @@ def build_daily_update_message(tasks: list[Task]) -> str:
 
     lines = []
     for t in tasks:
-        due = t.deadline_utc.astimezone(TZ).strftime("%b %d, %H:%M")
+        due = t.deadline_utc.astimezone(TZ).strftime("%b %d, %H:%M") if t.deadline_utc is not None else "Not set"
         assignee = t.assignee if t.assignee != "@unassigned" else "Unassigned"
         lines.append(
             f"{status_emoji(t.status)} #{t.id} — {t.title}\n"
@@ -2354,8 +2413,8 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
     logging.info("Fiverr intake source=%s message_id=%s order_id=%s action=%s reason=%s",
                  source, email.message_id, order_id, decision.action, decision.reason)
     # A verified seller-start order must not disappear merely because its
-    # deadline cannot be parsed. Retain the evidence, create only a topic, and
-    # require a verified later deadline before tasks/reminders are enabled.
+    # deadline cannot be parsed. Retain the evidence and create a usable task;
+    # only deadline-based reminders require a verified deadline.
     if decision.action == "quarantine" and decision.order and decision.reason in {
         "missing_due_date", "invalid_due_date", "conflicting_due_dates",
     }:
@@ -2404,6 +2463,18 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
     order = decision.order
     row, inserted = reserve_fiverr_order(order, chat_id_int)
     if row and row["task_id"]:
+        task = get_task(row["task_id"], chat_id_int)
+        if task and task.deadline_utc is None:
+            await publish_undated_task_controls(application, task)
+            if order.due is not None:
+                deadline = (order.due - timedelta(days=1)).astimezone(ZoneInfo("UTC"))
+                with get_db() as conn:
+                    changed = conn.execute("UPDATE tasks SET deadline_utc = ? WHERE id = ? AND chat_id = ? AND deadline_utc IS NULL",
+                                           (deadline.isoformat(), task.id, chat_id_int)).rowcount
+                task = get_task(task.id, chat_id_int)
+                if changed and task.status != "done":
+                    cancel_task_jobs(application, task.id)
+                    await schedule_task_jobs(application, task)
         logging.info("Duplicate Fiverr order %s ignored; task already exists", order.order_id)
         return
     pending_topic = (
@@ -2411,11 +2482,6 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         if row and row["status"] == "awaiting_due" and row["chat_id"] == chat_id_int
         else None
     )
-    if pending_topic and decision.action == "create_topic_pending_due":
-        logging.info("Duplicate order %s ignored; topic already awaits a deadline", order.order_id)
-        if decision.reason != "milestone_awaiting_due":
-            await notify_fiverr_pending_deadline(application, order, chat_id_int, pending_topic, decision.reason)
-        return
     if row and not inserted and not pending_topic:
         await quarantine_inbound_email(application, chat_id_int,
             source=source,
@@ -2440,18 +2506,11 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
         mark_fiverr_order_quarantined(order.order_id, "topic_create_failed")
         return
 
-    if decision.action == "create_topic_pending_due":
-        mark_fiverr_order_awaiting_due(order.order_id, thread_id)
-        logging.info("Created order topic for %s; awaiting an explicit deadline", order.order_id)
-        if decision.reason != "milestone_awaiting_due":
-            await notify_fiverr_pending_deadline(application, order, chat_id_int, thread_id, decision.reason)
-        return
-
-    # Only dated create decisions reach task/reminder creation.
-    if order.due is None:
-        raise ValueError("A verified deadline is required to create a Fiverr task")
-    deadline_local = (order.due - timedelta(days=1)).astimezone(TZ)
-    deadline_utc = deadline_local.astimezone(ZoneInfo("UTC"))
+    # Save the existing topic before task insertion so a failed transaction can
+    # retry without creating a second Telegram topic.
+    mark_fiverr_order_awaiting_due(order.order_id, thread_id)
+    deadline_utc = ((order.due - timedelta(days=1)).astimezone(ZoneInfo("UTC"))
+                    if order.due is not None else None)
     task_id = save_fiverr_task(order, deadline_utc, int(owner_id), chat_id_int, thread_id)
     if task_id is None:
         logging.warning("Fiverr order %s changed during task creation; no duplicate task inserted", order.order_id)
@@ -2459,6 +2518,9 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
 
     task = get_task(task_id, chat_id_int)
     if task:
+        if task.deadline_utc is None:
+            await publish_undated_task_controls(application, task)
+            return
         await schedule_task_jobs(application, task)
         await application.bot.send_message(
             chat_id=chat_id_int,
@@ -2487,6 +2549,53 @@ async def process_inbound_email(application: Application, email: InboundEmail, s
             owner_id=int(owner_id),
             prompt_message_id=prompt.message_id,
         )
+
+
+async def publish_undated_task_controls(application, task: Task) -> None:
+    """Durably publish controls once; definite failures retry, uncertain sends don't."""
+    owner = get_setting("owner_username") or "@owner"
+    stages = [
+        ("panel", task_control_panel_text(task), task_control_keyboard(task, task.chat_id)),
+        ("assign", f"{owner}, who should be assigned? Tap a name or reply with @username.",
+         assignment_keyboard(task.id, task.chat_id)),
+    ]
+    for stage, text, markup in stages:
+        key = f"undated_task:{task.chat_id}:{task.id}:{stage}"
+        await send_scheduled_message(application.bot, key, task.chat_id, text,
+                                     thread_id=task.thread_id, reply_markup=markup)
+        with get_db() as conn:
+            result = conn.execute("SELECT state, message_id FROM scheduled_sends WHERE key = ?", (key,)).fetchone()
+        if result and result["state"] == "failed":
+            raise RuntimeError("Task controls delivery failed; retry safely")
+        if stage == "assign" and result and result["state"] == "sent":
+            # Do not revive a resolved assignment when an email is replayed.
+            if task.assignee == "@unassigned" and task.status != "done":
+                create_pending_assignment(task.chat_id, task.id, task.thread_id,
+                                          int(get_setting("owner_user_id")), result["message_id"])
+
+
+async def upgrade_undated_order_topic(application, order_id: str) -> Optional[int]:
+    """Explicit, idempotent upgrade of a recorded awaiting_due topic, never create a topic."""
+    chat_id = get_setting("general_chat_id")
+    owner_id = get_setting("owner_user_id")
+    if not chat_id or not owner_id:
+        return None
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM fiverr_orders WHERE order_id = ?", (order_id,)).fetchone()
+    if not row or row["chat_id"] != int(chat_id) or not row["topic_thread_id"]:
+        return None
+    if row["task_id"]:
+        task = get_task(row["task_id"], int(chat_id))
+        if task and task.deadline_utc is None:
+            await publish_undated_task_controls(application, task)
+        return row["task_id"]
+    if row["status"] != "awaiting_due":
+        return None
+    order = FiverrOrder(order_id, row["client_name"], None, row["source"], row["last_message_id"] or "")
+    task_id = save_fiverr_task(order, None, int(owner_id), int(chat_id), row["topic_thread_id"])
+    if task_id:
+        await publish_undated_task_controls(application, get_task(task_id, int(chat_id)))
+    return task_id
 
 
 async def handle_gmail_webhook(request: web.Request, application: Application) -> web.Response:
@@ -2852,7 +2961,7 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("📭 No open tasks.")
             return
         lines = [
-            f"{status_emoji(t.status)} #{t.id} — {t.title} (Due: {t.deadline_utc.astimezone(TZ).strftime('%b %d')})"
+            f"{status_emoji(t.status)} #{t.id} — {t.title} (Due: {t.deadline_utc.astimezone(TZ).strftime('%b %d') if t.deadline_utc is not None else 'Not set'})"
             for t in tasks
         ]
         await send_long_message(

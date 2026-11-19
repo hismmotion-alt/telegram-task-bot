@@ -62,18 +62,26 @@ Use a Google Apps Script to forward Fiverr emails to the bot.
   `Delivery date: 2026-11-20`. Incomplete, unsupported, or conflicting deadlines
   are quarantined instead of guessed. A later requirements email can use a stored
   pending deadline only when it contains no new deadline evidence.
-- A verified seller-start email with an order ID creates one topic even when its
-  deadline is missing, malformed or conflicting. It remains in `awaiting_due`
-  state without tasks or reminders. Ordinary and invalid-deadline starts include
-  a deduplicated explanation in the topic; date validation is not relaxed.
-  Replay/restart reuse that topic; a later verified deadline upgrades it atomically.
-  Other unrecognized/unsafe messages remain quarantined and visibly alerted.
-  Verify existing Telegram/database records before recovering historical orders.
-  Do not replay an uncertain topic-creation attempt blindly.
-- On startup, recent (48-hour) deadline quarantines can be recovered as pending
-  topics only when the stored seller-start subject is recognized and there is
-  no order ledger, task, matching topic record, or prior uncertain creation.
-  Quarantine history is preserved. Recovery never supplies a deadline.
+- A verified seller-start email with an order ID creates one topic and a normal
+  usable task even when its deadline is missing, malformed or conflicting.
+  The task has a real SQL NULL deadline, displays `Not set`, and supports
+  assignment, progress, feedback and completion. Only deadline reminders are
+  skipped. Invalid date evidence remains in quarantine history; dates are not guessed.
+  Replay/restart reuse the task/topic; a later verified date enriches a null
+  deadline atomically, without replacing an existing deadline or creating a task.
+- Undated-task controls have per-message delivery records. Definite send failures
+  retry safely; uncertain sends are left for `/task sendissues` reconciliation.
+- On startup, recent (48-hour) deadline quarantines can be recovered only when
+  the stored seller-start subject is recognized and there is no existing order
+  ledger, task, matching topic record, or prior uncertain creation.
+- Existing legacy `awaiting_due` topics can be upgraded explicitly using
+  `upgrade_undated_order_topic(application, order_id)`. This reuses the recorded
+  topic, atomically inserts/links one task, and never calls topic creation.
+  Repeated invocation is safe. Do not replay uncertain topic-creation attempts.
+- Before deployment, back up the live SQLite database with SQLite's backup API.
+  Startup transactionally removes only the tasks deadline NOT NULL constraint,
+  preserving IDs, data, indexes, triggers, views and autoincrement sequence.
+  Verify the upgrade and control delivery in the existing topic before reporting success.
 
 ## Tests
 Run the offline suites after installing requirements (Node.js is also needed):

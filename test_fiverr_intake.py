@@ -142,6 +142,55 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         main.DB_PATH = self.old_db_path
         os.unlink(self.tmp.name)
 
+    async def test_existing_pending_topic_upgrades_in_place_without_deadline(self):
+        order = main.FiverrOrder("FO555566667777", "samplebuyer", None, "Gmail", "existing")
+        main.reserve_fiverr_order(order, -100123)
+        main.mark_fiverr_order_awaiting_due(order.order_id, 424242)
+        task_id = await main.upgrade_undated_order_topic(self.app, order.order_id)
+        self.assertEqual(await main.upgrade_undated_order_topic(self.app, order.order_id), task_id)
+        restarted = FakeApplication()
+        self.assertEqual(await main.upgrade_undated_order_topic(restarted, order.order_id), task_id)
+        self.assertEqual(self.app.bot.created_topics, [])
+        self.assertEqual(restarted.bot.messages, [])
+        self.assertEqual(len(self.app.bot.messages), 2)
+        task = main.get_task(task_id, -100123)
+        self.assertEqual(task.thread_id, 424242)
+        self.assertIsNone(task.deadline_utc)
+        self.assertEqual(self.app.job_queue.jobs(), [])
+        self.assertIn("Not set", main.task_control_panel_text(task))
+        main.set_task_assignee(task.id, task.chat_id, "@artist")
+        self.assertEqual(main.get_task(task.id, task.chat_id).assignee, "@artist")
+        done, changed = main.mark_task_done(task.id, task.chat_id)
+        self.assertTrue(changed)
+        self.assertEqual(done.status, "done")
+        with main.get_db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+    async def test_null_deadline_assignment_and_completion_callbacks(self):
+        await main.process_inbound_email(self.app, email("You've received an order from buyer", "Order #FO888899990000."), "Gmail")
+        task = main.get_task(1, -100123)
+        context = SimpleNamespace(bot=self.app.bot, application=self.app)
+        owner = SimpleNamespace(id=42, username="owner")
+        assign = FakeCallbackQuery(f"order_assign:{task.id}:artist", task.chat_id, task.thread_id)
+        await main.handle_order_assign_callback(SimpleNamespace(callback_query=assign, effective_user=owner), context)
+        self.assertEqual(main.get_task(task.id, task.chat_id).assignee, "@artist")
+        deadline = FakeCallbackQuery(f"order_ctl:{task.id}:deadline", task.chat_id, task.thread_id)
+        await main.handle_order_control_callback(SimpleNamespace(callback_query=deadline, effective_user=owner), context)
+        self.assertEqual(deadline.answers[0][0], "Not set")
+        done = FakeCallbackQuery(f"order_ctl:{task.id}:done", task.chat_id, task.thread_id)
+        await main.handle_order_control_callback(SimpleNamespace(callback_query=done, effective_user=owner), context)
+        self.assertEqual(main.get_task(task.id, task.chat_id).status, "done")
+        self.assertEqual(self.app.job_queue.jobs(), [])
+
+    async def test_undated_controls_uncertain_delivery_never_blindly_repeats(self):
+        inbound = email("You've received an order from samplebuyer", "Order #FO1234567890. Due tomorrow.")
+        self.app.bot.send_exceptions = [main.TimedOut("synthetic")]
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        await main.process_inbound_email(self.app, inbound, "Gmail")
+        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(main.scheduled_send_issues()[0]["state"], "uncertain")
+
     async def test_seller_start_creates_topic_and_task(self):
         inbound = email(
             "Great news: You've received an order from flowpest",
@@ -222,14 +271,15 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         await main.process_inbound_email(restarted, inbound, "Gmail")
         self.assertEqual(len(self.app.bot.created_topics), 1)
         self.assertEqual(restarted.bot.created_topics, [])
-        self.assertEqual(self.app.bot.messages, [])
+        self.assertEqual(len(self.app.bot.messages), 2)
         self.assertEqual(self.app.job_queue.jobs(), [])
         with main.get_db() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
             row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
-            self.assertEqual(row["status"], "awaiting_due")
+            self.assertEqual(row["status"], "created")
             self.assertEqual(row["topic_thread_id"], self.app.bot.created_topics[0][2])
-            self.assertIsNone(row["task_id"])
+            self.assertIsNotNone(row["task_id"])
+            self.assertIsNone(main.get_task(row["task_id"], -100123).deadline_utc)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM inbound_quarantine").fetchone()[0], 0)
 
     async def test_milestone_order_with_explicit_due_creates_once(self):
@@ -266,6 +316,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["status"], "created")
             task = main.get_task(row["task_id"], -100123)
         self.assertEqual(task.thread_id, self.app.bot.created_topics[0][2])
+        self.assertEqual(task.deadline_utc.astimezone(main.TZ), datetime(2026, 11, 19, tzinfo=main.TZ))
         await main.process_inbound_email(self.app, followup, "Gmail")
         self.assertEqual(len(self.app.bot.created_topics), 1)
         with main.get_db() as conn:
@@ -273,7 +324,9 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_topic_task_upgrade_is_atomic_after_link_failure(self):
         initial = email("You've received a milestones order from buyer7", "Order #FO1234AB56789.")
-        await main.process_inbound_email(self.app, initial, "Gmail")
+        order = main.FiverrOrder("FO1234AB56789", "buyer7", None, "Gmail", "old-email")
+        main.reserve_fiverr_order(order, -100123)
+        main.mark_fiverr_order_awaiting_due(order.order_id, 424242)
         dated = email("The requirements are in!", "buyer7 has sent the requirements and your order FO1234AB56789 is now in progress. Due Nov 20, 2026.", message_id="dated-upgrade")
         with main.get_db() as conn:
             conn.execute("""CREATE TRIGGER fail_order_link BEFORE UPDATE OF task_id ON fiverr_orders
@@ -291,7 +344,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
             row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
             self.assertEqual(row["status"], "created")
             self.assertIsNotNone(row["task_id"])
-        self.assertEqual(len(self.app.bot.created_topics), 1)
+        self.assertEqual(len(self.app.bot.created_topics), 0)
 
     async def test_milestone_with_invalid_date_creates_pending_topic_not_task(self):
         inbound = email("You've received a milestones order from buyer7", "Order #FO1234AB56789. Due tomorrow.")
@@ -318,8 +371,8 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         await main.process_inbound_email(self.app, followup, "Gmail")
         self.assertEqual(len(self.app.bot.created_topics), 1)
         with main.get_db() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
-            self.assertEqual(conn.execute("SELECT status FROM fiverr_orders").fetchone()[0], "awaiting_due")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT status FROM fiverr_orders").fetchone()[0], "created")
 
     async def test_requirements_conflict_or_invalid_date_never_reuses_pending_due(self):
         waiting = email(
@@ -583,7 +636,7 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         )
         await main.process_inbound_email(self.app, inbound, "Gmail")
         with main.get_db() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
             row = conn.execute("SELECT * FROM inbound_quarantine").fetchone()
         self.assertEqual(row["reason"], "missing_due_date")
 
@@ -624,14 +677,15 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         restarted = FakeApplication()
         await main.process_inbound_email(restarted, inbound, "Gmail")
         self.assertEqual(len(self.app.bot.created_topics), 1)
-        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(len(self.app.bot.messages), 2)
         self.assertEqual(restarted.bot.created_topics, [])
         self.assertEqual(restarted.bot.messages, [])
         self.assertEqual(self.app.job_queue.jobs(), [])
         with main.get_db() as conn:
             row = conn.execute("SELECT * FROM fiverr_orders").fetchone()
-            self.assertEqual(row["status"], "awaiting_due")
-            self.assertIsNone(row["task_id"])
+            self.assertEqual(row["status"], "created")
+            self.assertIsNotNone(row["task_id"])
+            self.assertIsNone(main.get_task(row["task_id"], -100123).deadline_utc)
         dated = email("You've received an order from samplebuyer",
                       "Order #FO1234567890 is due Nov 19, 2026 at 11:42 AM PST.", message_id="verified")
         await main.process_inbound_email(restarted, dated, "Gmail")
@@ -644,11 +698,11 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_deadline_warning_failure_retries_without_new_topic(self):
         inbound = email("You've received an order from samplebuyer", "Order #FO1234567890. Due tomorrow.")
         self.app.bot.send_exceptions = [BadRequest("synthetic failure")]
-        with self.assertRaisesRegex(RuntimeError, "warning failed"):
+        with self.assertRaisesRegex(RuntimeError, "controls delivery failed"):
             await main.process_inbound_email(self.app, inbound, "Gmail")
         await main.process_inbound_email(self.app, inbound, "Gmail")
         self.assertEqual(len(self.app.bot.created_topics), 1)
-        self.assertEqual(len(self.app.bot.messages), 1)
+        self.assertEqual(len(self.app.bot.messages), 2)
         self.assertEqual(self.app.job_queue.jobs(), [])
 
     async def test_recent_quarantine_recovery_creates_only_pending_and_dedupes(self):
@@ -663,8 +717,8 @@ class FiverrIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.job_queue.jobs(), [])
         with main.get_db() as conn:
             order = conn.execute("SELECT * FROM fiverr_orders").fetchone()
-            self.assertEqual(order["status"], "awaiting_due")
-            self.assertIsNone(order["task_id"])
+            self.assertEqual(order["status"], "created")
+            self.assertIsNotNone(order["task_id"])
             self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM inbound_quarantine").fetchone()[0], 1)
 
     async def test_recent_recovery_skips_old_unknown_existing_and_uncertain(self):
